@@ -39,6 +39,7 @@ export class CodexProvider implements AgentProvider {
           }
         }
       },
+      input.onProcessStart,
     );
 
     let sessionId = streamedSessionId;

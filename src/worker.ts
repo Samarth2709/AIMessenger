@@ -24,6 +24,14 @@ export class JobWorker {
 
   start(): void {
     if (this.active) return;
+    for (const pid of this.db.runningProcessPids()) {
+      try {
+        process.kill(-pid, "SIGKILL");
+        console.warn(`Killed orphaned agent process group ${pid}.`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
     const recovered = this.db.recoverInterruptedJobs();
     if (recovered) console.warn(`Marked ${recovered} previously running job(s) interrupted.`);
     this.db.recoverOutbox();
@@ -126,6 +134,7 @@ export class JobWorker {
       workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
       schemaPath: path.join(this.config.appRoot, "schemas", "agent-result.schema.json"),
       signal,
+      onProcessStart: (pid) => this.db.setJobProcessPid(job.id, pid),
     });
     if (signal.aborted) throw new DOMException("Job canceled.", "AbortError");
 

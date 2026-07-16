@@ -26,6 +26,8 @@ export class ClaudeProvider implements AgentProvider {
       args,
       input.workingDirectory,
       input.signal,
+      undefined,
+      input.onProcessStart,
     );
     let payload: unknown;
     try {

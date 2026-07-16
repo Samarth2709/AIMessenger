@@ -8,6 +8,7 @@ export interface ProviderRunInput {
   workingDirectory: string;
   schemaPath: string;
   signal: AbortSignal;
+  onProcessStart?: (pid: number) => void;
 }
 
 export interface ProviderRunOutput {

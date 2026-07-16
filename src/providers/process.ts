@@ -17,6 +17,7 @@ export function runProcess(
   cwd: string,
   signal: AbortSignal,
   onStdoutChunk?: (chunk: string) => void,
+  onSpawn?: (pid: number) => void,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -28,6 +29,7 @@ export function runProcess(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    if (child.pid) onSpawn?.(child.pid);
 
     const append = (current: string, chunk: Buffer): string => {
       const next = current + chunk.toString("utf8");

@@ -66,6 +66,7 @@ export class AppDatabase {
         finished_at TEXT,
         error TEXT,
         result_text TEXT,
+        process_pid INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(update_id) REFERENCES inbound_updates(update_id),
         FOREIGN KEY(user_message_id) REFERENCES transcript(id),
@@ -109,6 +110,10 @@ export class AppDatabase {
 
       INSERT OR IGNORE INTO provider_sessions(provider) VALUES ('codex'), ('claude');
     `);
+    const jobColumns = this.db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
+    if (!jobColumns.some((column) => column.name === "process_pid")) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN process_pid INTEGER");
+    }
   }
 
   close(): void {
@@ -346,7 +351,8 @@ export class AppDatabase {
       return this.db
         .prepare(
           `UPDATE jobs SET status = 'interrupted', finished_at = CURRENT_TIMESTAMP,
-            error = 'Service restarted while the agent was running; use /retry to run it again.'
+            error = 'Service restarted while the agent was running; use /retry to run it again.',
+            process_pid = NULL
            WHERE status = 'running'`,
         )
         .run().changes;
@@ -368,7 +374,7 @@ export class AppDatabase {
       this.db
         .prepare(
           `UPDATE jobs SET status = 'completed', result_text = ?, finished_at = CURRENT_TIMESTAMP,
-            error = NULL WHERE id = ?`,
+            error = NULL, process_pid = NULL WHERE id = ?`,
         )
         .run(resultText, id);
       this.db
@@ -393,6 +399,19 @@ export class AppDatabase {
         "UPDATE jobs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
       )
       .run(status, error, id);
+    this.db.prepare("UPDATE jobs SET process_pid = NULL WHERE id = ?").run(id);
+  }
+
+  setJobProcessPid(id: number, pid: number): void {
+    this.db.prepare("UPDATE jobs SET process_pid = ? WHERE id = ? AND status = 'running'").run(pid, id);
+  }
+
+  runningProcessPids(): number[] {
+    return (
+      this.db
+        .prepare("SELECT process_pid FROM jobs WHERE status = 'running' AND process_pid IS NOT NULL")
+        .all() as Array<{ process_pid: number }>
+    ).map((row) => row.process_pid);
   }
 
   taintProvider(provider: ProviderName): void {

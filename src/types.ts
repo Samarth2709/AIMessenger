@@ -40,6 +40,7 @@ export interface JobRow {
   finished_at: string | null;
   error: string | null;
   result_text: string | null;
+  process_pid: number | null;
   created_at: string;
 }
 
