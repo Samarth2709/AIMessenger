@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="${AIMESSENGER_DATA_DIR:-$HOME/Library/Application Support/AIMessenger}"
 ENV_FILE="${AIMESSENGER_ENV_FILE:-$DATA_DIR/env}"

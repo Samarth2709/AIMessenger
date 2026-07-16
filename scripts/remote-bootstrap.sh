@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
 if ! command -v node >/dev/null 2>&1; then
   if command -v brew >/dev/null 2>&1; then
     brew install node
