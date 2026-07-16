@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "message": {
+      "type": "string",
+      "description": "The concise final response to send to the user."
+    },
+    "attachments": {
+      "type": "array",
+      "description": "Absolute local paths of files that should be sent to the user.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "caption": { "type": ["string", "null"] }
+        },
+        "required": ["path", "caption"]
+      }
+    }
+  },
+  "required": ["message", "attachments"]
+}
