@@ -73,7 +73,9 @@ export class AppDatabase {
         error TEXT,
         result_text TEXT,
         process_pid INTEGER,
+        model TEXT,
         cost_usd REAL,
+        cost_credits REAL,
         input_tokens INTEGER,
         cached_input_tokens INTEGER,
         output_tokens INTEGER,
@@ -153,7 +155,9 @@ export class AppDatabase {
     const jobColumns = this.db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
     const additions = [
       ["process_pid", "INTEGER"],
+      ["model", "TEXT"],
       ["cost_usd", "REAL"],
+      ["cost_credits", "REAL"],
       ["input_tokens", "INTEGER"],
       ["cached_input_tokens", "INTEGER"],
       ["output_tokens", "INTEGER"],
@@ -678,13 +682,15 @@ export class AppDatabase {
       this.db
         .prepare(
           `UPDATE jobs SET status = 'completed', result_text = ?, finished_at = CURRENT_TIMESTAMP,
-            error = NULL, process_pid = NULL, cost_usd = ?, input_tokens = ?,
-            cached_input_tokens = ?, output_tokens = ?, usage_recorded_at = CURRENT_TIMESTAMP
+            error = NULL, process_pid = NULL, model = ?, cost_usd = ?, cost_credits = ?,
+            input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, usage_recorded_at = CURRENT_TIMESTAMP
            WHERE id = ?`,
         )
         .run(
           resultText,
+          metrics?.model ?? null,
           metrics?.costUsd ?? null,
+          metrics?.codexCredits ?? null,
           metrics?.usage?.inputTokens ?? null,
           metrics?.usage?.cachedInputTokens ?? null,
           metrics?.usage?.outputTokens ?? null,
@@ -715,13 +721,15 @@ export class AppDatabase {
     this.db
       .prepare(
         `UPDATE jobs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP, process_pid = NULL,
-          cost_usd = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
+          model = ?, cost_usd = ?, cost_credits = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
           usage_recorded_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
       .run(
         status,
         error,
+        metrics?.model ?? null,
         metrics?.costUsd ?? null,
+        metrics?.codexCredits ?? null,
         metrics?.usage?.inputTokens ?? null,
         metrics?.usage?.cachedInputTokens ?? null,
         metrics?.usage?.outputTokens ?? null,
@@ -737,6 +745,8 @@ export class AppDatabase {
            COUNT(*) AS jobs,
            SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_jobs,
            COALESCE(SUM(cost_usd), 0) AS cost_usd,
+           SUM(CASE WHEN cost_credits IS NOT NULL THEN 1 ELSE 0 END) AS credited_jobs,
+           COALESCE(SUM(cost_credits), 0) AS cost_credits,
            COALESCE(SUM(input_tokens), 0) AS input_tokens,
            COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
            COALESCE(SUM(output_tokens), 0) AS output_tokens
@@ -750,6 +760,8 @@ export class AppDatabase {
       jobs: number;
       priced_jobs: number;
       cost_usd: number;
+      credited_jobs: number;
+      cost_credits: number;
       input_tokens: number;
       cached_input_tokens: number;
       output_tokens: number;
@@ -758,6 +770,8 @@ export class AppDatabase {
       jobs: 0,
       pricedJobs: 0,
       costUsd: 0,
+      creditedJobs: 0,
+      codexCredits: 0,
       usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
     });
     const providers: Record<ProviderName, CostProviderSummary> = {
@@ -769,6 +783,8 @@ export class AppDatabase {
         jobs: row.jobs,
         pricedJobs: row.priced_jobs,
         costUsd: row.cost_usd,
+        creditedJobs: row.credited_jobs,
+        codexCredits: row.cost_credits,
         usage: {
           inputTokens: row.input_tokens,
           cachedInputTokens: row.cached_input_tokens,
@@ -780,6 +796,8 @@ export class AppDatabase {
       jobs: rows.reduce((sum, row) => sum + row.jobs, 0),
       pricedJobs: rows.reduce((sum, row) => sum + row.priced_jobs, 0),
       costUsd: rows.reduce((sum, row) => sum + row.cost_usd, 0),
+      creditedJobs: rows.reduce((sum, row) => sum + row.credited_jobs, 0),
+      codexCredits: rows.reduce((sum, row) => sum + row.cost_credits, 0),
       providers,
     };
   }

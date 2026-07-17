@@ -63,7 +63,7 @@ npm run health
 - `/status` shows the active provider, model, live Codex turn, queue, and latest retryable job ID.
 - `/updates` shows the active release and the latest self-update outcome.
 - `/rollback` restores the prior healthy release and restarts after active work drains.
-- `/cost` shows today, the last seven calendar days, and all-time provider-reported spend; use `/cost <days>` or `/cost all` for one period. Claude reports a dollar total when available. Codex reports token counts but does not expose a dollar amount through its CLI, so AIMessenger does not guess one.
+- `/cost` shows today, the last seven calendar days, and all-time cost; use `/cost <days>` or `/cost all` for one period. Codex runs store the selected model and token usage, then calculate the matching Codex credits from the official rate card. Claude and the AI Security gateway show USD only when their provider returns a billed amount. Historic runs created before usage metering cannot be backfilled exactly.
 - `/stop` terminates the current process group and taints that provider session.
 - `/new codex|claude|all` starts clean native sessions.
 - `/retry <job-id>` retries a failed, canceled, or interrupted job.

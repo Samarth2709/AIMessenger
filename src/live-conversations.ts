@@ -6,6 +6,7 @@ import type { AppDatabase } from "./db.js";
 import type { AppLogger } from "./logger.js";
 import { prepareResultOutbox } from "./outbound.js";
 import { parseAgentResult, buildPrompt } from "./providers/structured.js";
+import { codexCreditsForUsage } from "./pricing.js";
 import { loadSkills } from "./skills.js";
 import type { TelegramClient } from "./telegram.js";
 import type { TokenUsage } from "./types.js";
@@ -87,6 +88,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
   private readonly steeringChats = new Set<number>();
   private readonly runningChats = new Set<number>();
   private readonly finalMessages = new Map<string, string>();
+  private readonly turnUsage = new Map<string, TokenUsage>();
   private readonly completingTurns = new Set<string>();
   private readonly firstMessageTimers = new Map<string, NodeJS.Timeout>();
   private readonly firstMessageDeliveries = new Map<string, Promise<void>>();
@@ -115,6 +117,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
     for (const timer of this.firstMessageTimers.values()) clearTimeout(timer);
     this.firstMessageTimers.clear();
     this.firstMessageDeliveries.clear();
+    this.turnUsage.clear();
     await this.appServer?.close();
   }
 
@@ -316,6 +319,14 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
   }
 
   private onServerEvent(event: CodexAppServerEvent): void {
+    if (event.method === "thread/tokenUsage/updated") {
+      const threadId = stringAt(event.params, "threadId");
+      const turnId = stringAt(event.params, "turnId");
+      const tokenUsage = asRecord(event.params.tokenUsage);
+      const usage = tokenUsageFrom(tokenUsage?.last);
+      if (threadId && turnId && usage) this.turnUsage.set(this.turnKey(threadId, turnId), usage);
+      return;
+    }
     if (event.method === "item/completed") {
       const item = asRecord(event.params.item);
       if (item?.type !== "agentMessage" || typeof item.text !== "string") return;
@@ -336,12 +347,13 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
     if (!threadId || !turnId || !status) return;
     const key = `${threadId}:${turnId}`;
     const finalMessage = agentMessageFromItems(turn?.items) ?? this.finalMessages.get(key);
-    const usage = tokenUsageFrom(turn?.usage) ?? tokenUsageFrom(event.params.usage);
+    const usage = this.turnUsage.get(key) ?? tokenUsageFrom(turn?.usage) ?? tokenUsageFrom(event.params.usage);
     if (this.completingTurns.has(key)) return;
     this.completingTurns.add(key);
     void this.completeTurn(threadId, turnId, status, finalMessage, usage).finally(() => {
       this.completingTurns.delete(key);
       this.finalMessages.delete(key);
+      this.turnUsage.delete(key);
       this.discardFirstMessage(threadId, turnId);
     });
   }
@@ -378,13 +390,18 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       const outbound = await prepareResultOutbox(result, chatId, jobId, this.config);
       const current = this.db.getLiveConversation(chatId);
       if (!current || current.active_job_id !== jobId) return;
+      const codexCredits = codexCreditsForUsage(conversation.model ?? undefined, usage);
       this.db.completeJob(
         jobId,
         result.message,
         "codex",
         threadId,
         outbound,
-        usage ? { usage } : undefined,
+        {
+          model: conversation.model ?? undefined,
+          ...(usage ? { usage } : {}),
+          ...(codexCredits !== undefined ? { codexCredits } : {}),
+        },
       );
       if (!this.db.finishLiveConversation(chatId, jobId)) return;
       this.clearChat(chatId);

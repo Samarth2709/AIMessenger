@@ -44,6 +44,16 @@ function responseUsage(payload: unknown): TokenUsage | undefined {
   return { inputTokens, cachedInputTokens, outputTokens };
 }
 
+function responseCost(payload: unknown, headers: Headers): number | undefined {
+  const headerValue = headers.get("x-litellm-response-cost");
+  if (headerValue?.trim()) {
+    const headerCost = Number(headerValue);
+    if (Number.isFinite(headerCost) && headerCost >= 0) return headerCost;
+  }
+  if (!payload || typeof payload !== "object") return undefined;
+  return numberAt((payload as { response_cost?: unknown }).response_cost);
+}
+
 function numberAt(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
@@ -90,11 +100,14 @@ export class GatewayProvider implements AgentProvider {
     }
     const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");
     const usage = responseUsage(payload);
+    const costUsd = responseCost(payload, response.headers);
     return {
       result: parseAgentResult(message),
       sessionId: STATELESS_SESSION_ID,
       rawOutput,
-      ...(usage ? { metrics: { usage } } : {}),
+      ...(usage || costUsd !== undefined
+        ? { metrics: { ...(usage ? { usage } : {}), ...(costUsd !== undefined ? { costUsd } : {}) } }
+        : {}),
     };
   }
 }

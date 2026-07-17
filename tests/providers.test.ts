@@ -81,6 +81,7 @@ describe("provider adapters", () => {
           choices: [{ message: { content: "gateway ok" } }],
           usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 25 }, completion_tokens: 50 },
         }),
+        { headers: { "x-litellm-response-cost": "0.0042" } },
       ),
     );
     const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
@@ -88,6 +89,7 @@ describe("provider adapters", () => {
     expect(output.result).toEqual({ message: "gateway ok", attachments: [] });
     expect(output.sessionId).toBe("__aimessenger_stateless__");
     expect(output.metrics).toEqual({
+      costUsd: 0.0042,
       usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
     });
     expect(request).toHaveBeenCalledWith(
@@ -96,6 +98,23 @@ describe("provider adapters", () => {
         headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
       }),
     );
+  });
+
+  it("does not treat an absent gateway cost header as a zero-dollar charge", async () => {
+    const request = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "gateway ok" } }],
+          usage: { prompt_tokens: 10, completion_tokens: 5 },
+        }),
+      ),
+    );
+
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
+
+    expect(output.metrics).toEqual({
+      usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5 },
+    });
   });
 
   it("routes configured gateway models without changing Codex behavior", async () => {

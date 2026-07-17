@@ -51,6 +51,7 @@ function createRunningTurn(db: AppDatabase, manager: LiveCodexConversationManage
     userId: 123,
     prompt: "Inspect this project.",
     body: "Inspect this project.",
+    model: "gpt-5.6-terra",
   });
   const jobId = queued.jobId!;
   expect(db.setLiveConversationTurn(chatId, jobId, "thread-1", "turn-1")).toBe(true);
@@ -73,7 +74,20 @@ function agentMessage(text: string): CodexAppServerEvent {
   };
 }
 
-function completed(finalMessage: string, usage?: Record<string, number>): CodexAppServerEvent {
+function tokenUsage(): CodexAppServerEvent {
+  return {
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      tokenUsage: {
+        last: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+      },
+    },
+  };
+}
+
+function completed(finalMessage: string): CodexAppServerEvent {
   return {
     method: "turn/completed",
     params: {
@@ -82,7 +96,6 @@ function completed(finalMessage: string, usage?: Record<string, number>): CodexA
         id: "turn-1",
         status: "completed",
         items: [{ type: "agentMessage", text: finalMessage }],
-        ...(usage ? { usage } : {}),
       },
     },
   };
@@ -114,14 +127,8 @@ describe("LiveCodexConversationManager", () => {
       { chatId, jobId, text: "I’ll inspect the workspace, then make the targeted change." },
     ]);
 
-    emit(
-      manager,
-      completed('{"message":"Implemented and verified the change.","attachments":[]}', {
-        input_tokens: 100,
-        cached_input_tokens: 25,
-        output_tokens: 50,
-      }),
-    );
+    emit(manager, tokenUsage());
+    emit(manager, completed('{"message":"Implemented and verified the change.","attachments":[]}'));
     await flush();
 
     expect(db.getJob(jobId)?.status).toBe("completed");
@@ -129,6 +136,8 @@ describe("LiveCodexConversationManager", () => {
       input_tokens: 100,
       cached_input_tokens: 25,
       output_tokens: 50,
+      model: "gpt-5.6-terra",
+      cost_credits: 0.02359375,
     });
     expect(notifyDelivery).toHaveBeenCalledOnce();
     const final = db.claimNextOutbox()!;

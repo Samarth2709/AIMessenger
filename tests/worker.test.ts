@@ -61,13 +61,17 @@ describe("JobWorker", () => {
         result: { message: "finished", attachments: [] },
         sessionId: "session-1",
         rawOutput: "",
-        metrics: { costUsd: 0.0125 },
+        metrics: {
+          costUsd: 0.0125,
+          usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+        },
       })),
     };
     const config = {
       AIMESSENGER_DATA_DIR: dir,
       AIMESSENGER_WORKING_DIR: dir,
       JOB_TIMEOUT_MINUTES: 1,
+      CODEX_MODEL: "gpt-5.6-terra",
       jobsDir: path.join(dir, "jobs"),
       appRoot: path.resolve("."),
       identityPath: path.resolve("IDENTITY.md"),
@@ -89,6 +93,10 @@ describe("JobWorker", () => {
     });
     expect(db.getProviderSession("codex").session_id).toBe("session-1");
     expect(db.costSummary().costUsd).toBe(0.0125);
+    expect(db.getJob(jobId)).toMatchObject({
+      model: "gpt-5.6-terra",
+      cost_credits: 0.02359375,
+    });
     expect(logger.info).toHaveBeenCalledWith(
       "job.completed",
       expect.objectContaining({ job_id: jobId, result_length: 8 }),

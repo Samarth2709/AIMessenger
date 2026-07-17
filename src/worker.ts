@@ -1,10 +1,11 @@
 import fsSync from "node:fs";
 import path from "node:path";
-import { getProviderModel, type Config } from "./config.js";
+import { getProviderModel, isGatewayModel, type Config } from "./config.js";
 import type { AppDatabase } from "./db.js";
 import type { AppLogger } from "./logger.js";
 import { downloadAttachments } from "./media.js";
 import { prepareResultOutbox } from "./outbound.js";
+import { codexCreditsForUsage } from "./pricing.js";
 import { ProviderRunError, type AgentProvider } from "./providers/types.js";
 import { loadSkills } from "./skills.js";
 import type { ProviderName, RemoteAttachment } from "./types.js";
@@ -179,15 +180,16 @@ export class JobWorker {
         jobDir,
       );
       const session = this.db.getProviderSession(job.provider);
+      const model = getProviderModel(
+        this.config,
+        job.provider,
+        this.db.getSelectedModel(job.provider),
+      );
       const output = await this.providers[job.provider].run({
         identity,
         skills: skills.skills,
         provider: job.provider,
-        model: getProviderModel(
-          this.config,
-          job.provider,
-          this.db.getSelectedModel(job.provider),
-        ),
+        model,
         prompt: job.prompt,
         context: this.db.getContext(job.provider, job.user_message_id),
         attachmentPaths,
@@ -203,13 +205,21 @@ export class JobWorker {
       }
 
       const outbound = await prepareResultOutbox(output.result, job.chat_id, job.id, this.config);
+      const codexCredits =
+        job.provider === "codex" && !isGatewayModel(this.config, model)
+          ? codexCreditsForUsage(model, output.metrics?.usage)
+          : undefined;
       this.db.completeJob(
         job.id,
         output.result.message,
         job.provider,
         output.sessionId,
         outbound,
-        output.metrics,
+        {
+          ...output.metrics,
+          model,
+          ...(codexCredits !== undefined ? { codexCredits } : {}),
+        },
       );
       this.notify();
       return {

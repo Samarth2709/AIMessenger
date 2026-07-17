@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../src/db.js";
+import { codexCreditsForUsage } from "../src/pricing.js";
 import { STATELESS_SESSION_ID } from "../src/types.js";
 
 const tempDirs: string[] = [];
@@ -18,6 +20,46 @@ afterEach(() => {
 });
 
 describe("AppDatabase", () => {
+  it("adds model and credit fields to an existing jobs table", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-db-migration-"));
+    tempDirs.push(dir);
+    const databasePath = path.join(dir, "test.sqlite");
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        update_id INTEGER NOT NULL,
+        telegram_message_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        user_message_id INTEGER NOT NULL,
+        provider TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL,
+        retry_of INTEGER,
+        started_at TEXT,
+        finished_at TEXT,
+        error TEXT,
+        result_text TEXT,
+        process_pid INTEGER,
+        cost_usd REAL,
+        input_tokens INTEGER,
+        cached_input_tokens INTEGER,
+        output_tokens INTEGER,
+        usage_recorded_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    legacy.close();
+
+    const db = new AppDatabase(databasePath);
+    const columns = db.db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["model", "cost_credits"]),
+    );
+    db.close();
+  });
+
   it("deduplicates Telegram updates and queues one job", () => {
     const db = createDb();
     expect(db.recordUpdate(10, 20, 30, 40, "hello")).toBe(true);
@@ -318,6 +360,12 @@ describe("AppDatabase", () => {
       attachments: [],
     });
     db.completeJob(codex, "done", "codex", "codex-session", [], {
+      model: "gpt-5.6-terra",
+      codexCredits: codexCreditsForUsage("gpt-5.6-terra", {
+        inputTokens: 100,
+        cachedInputTokens: 25,
+        outputTokens: 50,
+      }),
       usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
     });
 
@@ -325,11 +373,14 @@ describe("AppDatabase", () => {
     expect(summary.jobs).toBe(2);
     expect(summary.pricedJobs).toBe(1);
     expect(summary.costUsd).toBe(0.0125);
+    expect(summary.creditedJobs).toBe(1);
+    expect(summary.codexCredits).toBe(0.02359375);
     expect(summary.providers.codex.usage).toEqual({
       inputTokens: 100,
       cachedInputTokens: 25,
       outputTokens: 50,
     });
+    expect(db.getJob(codex)).toMatchObject({ model: "gpt-5.6-terra", cost_credits: 0.02359375 });
     db.close();
   });
 });

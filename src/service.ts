@@ -40,25 +40,32 @@ function formatTokens(tokens: number): string {
   return new Intl.NumberFormat("en-US").format(tokens);
 }
 
+function formatCredits(credits: number): string {
+  return new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 6,
+  }).format(credits);
+}
+
 function formatCostLine(label: string, summary: CostSummary): string {
   if (summary.jobs === 0) return `${label}: no tracked runs`;
-  const reported =
-    summary.pricedJobs === 0
-      ? "no provider-reported USD"
-      : `${formatMoney(summary.costUsd)} reported`;
-  const unpriced = summary.jobs - summary.pricedJobs;
-  return `${label}: ${reported} across ${summary.jobs} run${summary.jobs === 1 ? "" : "s"}${
-    unpriced ? `; ${unpriced} without a dollar figure` : ""
-  }`;
+  const costs = [
+    ...(summary.creditedJobs
+      ? [`${formatCredits(summary.codexCredits)} Codex credit${summary.codexCredits === 1 ? "" : "s"}`]
+      : []),
+    ...(summary.pricedJobs ? [`${formatMoney(summary.costUsd)} provider-reported USD`] : []),
+  ];
+  return `${label}: ${costs.length ? costs.join("; ") : "cost not reported"} across ${summary.jobs} run${summary.jobs === 1 ? "" : "s"}`;
 }
 
 function formatCostReport(periods: Array<{ label: string; summary: CostSummary }>): string {
   const selected = periods.at(-1)!;
   const codex = selected.summary.providers.codex.usage;
   return [
-    "Spend (finished AIMessenger runs; provider-reported USD)",
+    "Cost (tracked AIMessenger runs)",
     ...periods.map(({ label, summary }) => formatCostLine(label, summary)),
-    `Codex and gateway tokens (${selected.label}; no dollar amount is available): ${formatTokens(codex.inputTokens)} input, ${formatTokens(codex.cachedInputTokens)} cached input, ${formatTokens(codex.outputTokens)} output`,
+    `Codex and gateway usage (${selected.label}): ${formatTokens(codex.inputTokens)} input, ${formatTokens(codex.cachedInputTokens)} cached input, ${formatTokens(codex.outputTokens)} output`,
+    "Codex is metered in credits; USD appears only when the provider reports it.",
     "Use /cost <days> for a calendar window, or /cost all.",
   ].join("\n");
 }
@@ -134,7 +141,9 @@ export class TelegramAgentService {
         }
       } catch (error) {
         if (!this.active || this.pollAbort.signal.aborted) break;
-        this.logger.error("telegram.poll_failed", error);
+        this.logger.error("telegram.poll_failed", error, {
+          detail: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+        });
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }

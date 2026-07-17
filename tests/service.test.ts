@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../src/config.js";
 import { AppDatabase } from "../src/db.js";
+import { codexCreditsForUsage } from "../src/pricing.js";
 import type { AppLogger } from "../src/logger.js";
 import type { LiveCodexConversations } from "../src/live-conversations.js";
 import type { ModelCatalog } from "../src/models.js";
@@ -255,12 +256,18 @@ describe("TelegramAgentService", () => {
       attachments: [],
     });
     db.completeJob(codex, "done", "codex", "codex-session", [], {
+      model: "gpt-5.6-terra",
+      codexCredits: codexCreditsForUsage("gpt-5.6-terra", {
+        inputTokens: 100,
+        cachedInputTokens: 25,
+        outputTokens: 50,
+      }),
       usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
     });
 
     await handle(service, update(16, "/cost"));
-    expect(sent.at(-1)).toContain("Today: $0.0125 reported across 2 runs; 1 without a dollar figure");
-    expect(sent.at(-1)).toContain("Codex and gateway tokens (All time; no dollar amount is available): 100 input, 25 cached input, 50 output");
+    expect(sent.at(-1)).toContain("Today: 0.023594 Codex credits; $0.0125 provider-reported USD across 2 runs");
+    expect(sent.at(-1)).toContain("Codex and gateway usage (All time): 100 input, 25 cached input, 50 output");
     db.close();
   });
 
