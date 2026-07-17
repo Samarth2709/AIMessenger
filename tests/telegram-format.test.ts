@@ -15,4 +15,12 @@ describe("formatTelegramText", () => {
       "[local](file:///private/file)",
     );
   });
+
+  it("renders Telegram-friendly headings, bullets, and dividers", () => {
+    expect(
+      formatTelegramText("## What's **already** built\n\n- Run `npm test`\n---\n1. Keep **the gate**"),
+    ).toBe(
+      "<b>What's already built</b>\n\n• Run <code>npm test</code>\n────────\n1. Keep <b>the gate</b>",
+    );
+  });
 });
