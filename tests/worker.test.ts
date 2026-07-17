@@ -51,6 +51,7 @@ describe("JobWorker", () => {
         result: { message: "finished", attachments: [] },
         sessionId: "session-1",
         rawOutput: "",
+        metrics: { costUsd: 0.0125 },
       })),
     };
     const config = {
@@ -73,6 +74,7 @@ describe("JobWorker", () => {
       expect(db.pendingOutboxCount()).toBe(0);
     });
     expect(db.getProviderSession("codex").session_id).toBe("session-1");
+    expect(db.costSummary().costUsd).toBe(0.0125);
     expect(fakeFetch).toHaveBeenCalledWith(
       "https://example.test/bottest-token-that-is-long-enough/sendMessage",
       expect.any(Object),

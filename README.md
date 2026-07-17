@@ -56,12 +56,15 @@ npm run health
 
 - `/codex` and `/claude` select the provider for new jobs.
 - `/status` shows the active provider, current job, and queue.
+- `/cost` shows today, the last seven calendar days, and all-time provider-reported spend; use `/cost <days>` or `/cost all` for one period. Claude reports a dollar total when available. Codex reports token counts but does not expose a dollar amount through its CLI, so AIMessenger does not guess one.
 - `/stop` terminates the current process group and taints that provider session.
 - `/new codex|claude|all` starts clean native sessions.
 - `/retry <job-id>` retries a failed, canceled, or interrupted job.
 - `/help` shows the command list.
 
 Messages arriving while a job runs are queued as later turns. The two providers keep their own native session IDs. When switching, transcript entries unseen by the target provider are injected for continuity.
+
+Cost tracking begins after upgrading to this version; the existing job database has no historic provider cost records to backfill.
 
 ## Files and recovery
 

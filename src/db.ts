@@ -2,7 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type {
+  CostProviderSummary,
+  CostSummary,
   JobRow,
+  JobMetrics,
   OutboxInput,
   OutboxRow,
   ProviderName,
@@ -67,6 +70,11 @@ export class AppDatabase {
         error TEXT,
         result_text TEXT,
         process_pid INTEGER,
+        cost_usd REAL,
+        input_tokens INTEGER,
+        cached_input_tokens INTEGER,
+        output_tokens INTEGER,
+        usage_recorded_at TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(update_id) REFERENCES inbound_updates(update_id),
         FOREIGN KEY(user_message_id) REFERENCES transcript(id),
@@ -111,8 +119,18 @@ export class AppDatabase {
       INSERT OR IGNORE INTO provider_sessions(provider) VALUES ('codex'), ('claude');
     `);
     const jobColumns = this.db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
-    if (!jobColumns.some((column) => column.name === "process_pid")) {
-      this.db.exec("ALTER TABLE jobs ADD COLUMN process_pid INTEGER");
+    const additions = [
+      ["process_pid", "INTEGER"],
+      ["cost_usd", "REAL"],
+      ["input_tokens", "INTEGER"],
+      ["cached_input_tokens", "INTEGER"],
+      ["output_tokens", "INTEGER"],
+      ["usage_recorded_at", "TEXT"],
+    ] as const;
+    for (const [name, type] of additions) {
+      if (!jobColumns.some((column) => column.name === name)) {
+        this.db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${type}`);
+      }
     }
   }
 
@@ -365,6 +383,7 @@ export class AppDatabase {
     provider: ProviderName,
     sessionId: string | null,
     outbound: OutboxInput[] = [],
+    metrics?: JobMetrics,
   ): number {
     return this.db.transaction(() => {
       const assistant = this.db
@@ -374,9 +393,18 @@ export class AppDatabase {
       this.db
         .prepare(
           `UPDATE jobs SET status = 'completed', result_text = ?, finished_at = CURRENT_TIMESTAMP,
-            error = NULL, process_pid = NULL WHERE id = ?`,
+            error = NULL, process_pid = NULL, cost_usd = ?, input_tokens = ?,
+            cached_input_tokens = ?, output_tokens = ?, usage_recorded_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
         )
-        .run(resultText, id);
+        .run(
+          resultText,
+          metrics?.costUsd ?? null,
+          metrics?.usage?.inputTokens ?? null,
+          metrics?.usage?.cachedInputTokens ?? null,
+          metrics?.usage?.outputTokens ?? null,
+          id,
+        );
       this.db
         .prepare(
           `UPDATE provider_sessions SET session_id = ?, last_message_id = ?, tainted = 0
@@ -393,13 +421,82 @@ export class AppDatabase {
     })();
   }
 
-  failJob(id: number, status: "failed" | "canceled", error: string): void {
+  failJob(
+    id: number,
+    status: "failed" | "canceled",
+    error: string,
+    metrics?: JobMetrics,
+  ): void {
     this.db
       .prepare(
-        "UPDATE jobs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+        `UPDATE jobs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP, process_pid = NULL,
+          cost_usd = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
+          usage_recorded_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
-      .run(status, error, id);
-    this.db.prepare("UPDATE jobs SET process_pid = NULL WHERE id = ?").run(id);
+      .run(
+        status,
+        error,
+        metrics?.costUsd ?? null,
+        metrics?.usage?.inputTokens ?? null,
+        metrics?.usage?.cachedInputTokens ?? null,
+        metrics?.usage?.outputTokens ?? null,
+        id,
+      );
+  }
+
+  costSummary(since?: string): CostSummary {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           provider,
+           COUNT(*) AS jobs,
+           SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_jobs,
+           COALESCE(SUM(cost_usd), 0) AS cost_usd,
+           COALESCE(SUM(input_tokens), 0) AS input_tokens,
+           COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+           COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM jobs
+         WHERE usage_recorded_at IS NOT NULL
+           AND (? IS NULL OR finished_at >= ?)
+         GROUP BY provider`,
+      )
+      .all(since ?? null, since ?? null) as Array<{
+      provider: ProviderName;
+      jobs: number;
+      priced_jobs: number;
+      cost_usd: number;
+      input_tokens: number;
+      cached_input_tokens: number;
+      output_tokens: number;
+    }>;
+    const emptyProvider = (): CostProviderSummary => ({
+      jobs: 0,
+      pricedJobs: 0,
+      costUsd: 0,
+      usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    });
+    const providers: Record<ProviderName, CostProviderSummary> = {
+      codex: emptyProvider(),
+      claude: emptyProvider(),
+    };
+    for (const row of rows) {
+      providers[row.provider] = {
+        jobs: row.jobs,
+        pricedJobs: row.priced_jobs,
+        costUsd: row.cost_usd,
+        usage: {
+          inputTokens: row.input_tokens,
+          cachedInputTokens: row.cached_input_tokens,
+          outputTokens: row.output_tokens,
+        },
+      };
+    }
+    return {
+      jobs: rows.reduce((sum, row) => sum + row.jobs, 0),
+      pricedJobs: rows.reduce((sum, row) => sum + row.priced_jobs, 0),
+      costUsd: rows.reduce((sum, row) => sum + row.cost_usd, 0),
+      providers,
+    };
   }
 
   setJobProcessPid(id: number, pid: number): void {

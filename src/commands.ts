@@ -5,6 +5,7 @@ export type ParsedCommand =
   | { kind: "help" }
   | { kind: "start" }
   | { kind: "status" }
+  | { kind: "cost"; window: "summary" | "all" | "days"; days?: number }
   | { kind: "stop" }
   | { kind: "switch"; provider: ProviderName }
   | { kind: "new"; target: ProviderName | "all" }
@@ -24,6 +25,15 @@ export function parseCommand(text: string): ParsedCommand {
       return { kind: "help" };
     case "/status":
       return { kind: "status" };
+    case "/cost": {
+      if (!rawArg) return { kind: "cost", window: "summary" };
+      if (rawArg.toLowerCase() === "all") return { kind: "cost", window: "all" };
+      const days = Number(rawArg);
+      if (Number.isSafeInteger(days) && days >= 1 && days <= 3650) {
+        return { kind: "cost", window: "days", days };
+      }
+      return { kind: "unknown", name: "/cost" };
+    }
     case "/stop":
       return { kind: "stop" };
     case "/codex":
@@ -51,6 +61,7 @@ export const HELP_TEXT = `AIMessenger commands:
 /codex — use Codex for new messages
 /claude — use Claude for new messages
 /status — show the running job and queue
+/cost [days|all] — show provider-reported spend and Codex token usage
 /stop — cancel the running job
 /new codex|claude|all — reset agent session history
 /retry <job-id> — retry a failed, canceled, or interrupted job

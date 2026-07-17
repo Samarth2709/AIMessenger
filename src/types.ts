@@ -25,6 +25,31 @@ export interface AgentResult {
   attachments: AgentAttachment[];
 }
 
+export interface TokenUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+}
+
+export interface JobMetrics {
+  costUsd?: number;
+  usage?: TokenUsage;
+}
+
+export interface CostProviderSummary {
+  jobs: number;
+  pricedJobs: number;
+  costUsd: number;
+  usage: TokenUsage;
+}
+
+export interface CostSummary {
+  jobs: number;
+  pricedJobs: number;
+  costUsd: number;
+  providers: Record<ProviderName, CostProviderSummary>;
+}
+
 export interface JobRow {
   id: number;
   update_id: number;
@@ -41,6 +66,11 @@ export interface JobRow {
   error: string | null;
   result_text: string | null;
   process_pid: number | null;
+  cost_usd: number | null;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
+  usage_recorded_at: string | null;
   created_at: string;
 }
 

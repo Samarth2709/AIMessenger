@@ -32,19 +32,23 @@ const baseInput = {
 describe("provider adapters", () => {
   it("captures the Codex thread and structured final event", async () => {
     const command = executable(
-      `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-123"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"codex ok\\",\\"attachments\\":[]}"}}'`,
+      `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-123"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"codex ok\\",\\"attachments\\":[]}"}}' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":25,"output_tokens":50}}'`,
     );
     const output = await new CodexProvider(command).run(baseInput);
     expect(output.sessionId).toBe("thread-123");
     expect(output.result).toEqual({ message: "codex ok", attachments: [] });
+    expect(output.metrics).toEqual({
+      usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+    });
   });
 
   it("captures Claude structured_output and session ID", async () => {
     const command = executable(
-      `printf '%s\\n' '{"type":"result","session_id":"claude-123","is_error":false,"structured_output":{"message":"claude ok","attachments":[]}}'`,
+      `printf '%s\\n' '{"type":"result","session_id":"claude-123","is_error":false,"total_cost_usd":0.0125,"structured_output":{"message":"claude ok","attachments":[]}}'`,
     );
     const output = await new ClaudeProvider(command).run(baseInput);
     expect(output.sessionId).toBe("claude-123");
     expect(output.result).toEqual({ message: "claude ok", attachments: [] });
+    expect(output.metrics).toEqual({ costUsd: 0.0125, usage: undefined });
   });
 });

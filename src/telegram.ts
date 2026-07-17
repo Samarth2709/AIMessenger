@@ -100,6 +100,7 @@ export class TelegramClient {
         { command: "codex", description: "Use Codex for new messages" },
         { command: "claude", description: "Use Claude for new messages" },
         { command: "status", description: "Show current job and queue" },
+        { command: "cost", description: "Show provider-reported spend" },
         { command: "stop", description: "Cancel the running job" },
         { command: "new", description: "Reset a provider session" },
         { command: "retry", description: "Retry a stopped or failed job" },

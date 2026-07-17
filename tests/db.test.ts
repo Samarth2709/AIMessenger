@@ -195,4 +195,42 @@ describe("AppDatabase", () => {
     expect(db.pendingOutboxCount()).toBe(0);
     db.close();
   });
+
+  it("aggregates provider-reported costs and Codex token usage", () => {
+    const db = createDb();
+    db.recordUpdate(131, 231, 331, 431, "claude work");
+    const claude = db.enqueueJob({
+      updateId: 131,
+      telegramMessageId: 231,
+      chatId: 331,
+      provider: "claude",
+      prompt: "claude work",
+      attachments: [],
+    });
+    db.completeJob(claude, "done", "claude", "claude-session", [], { costUsd: 0.0125 });
+
+    db.recordUpdate(132, 232, 331, 431, "codex work");
+    const codex = db.enqueueJob({
+      updateId: 132,
+      telegramMessageId: 232,
+      chatId: 331,
+      provider: "codex",
+      prompt: "codex work",
+      attachments: [],
+    });
+    db.completeJob(codex, "done", "codex", "codex-session", [], {
+      usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+    });
+
+    const summary = db.costSummary();
+    expect(summary.jobs).toBe(2);
+    expect(summary.pricedJobs).toBe(1);
+    expect(summary.costUsd).toBe(0.0125);
+    expect(summary.providers.codex.usage).toEqual({
+      inputTokens: 100,
+      cachedInputTokens: 25,
+      outputTokens: 50,
+    });
+    db.close();
+  });
 });
