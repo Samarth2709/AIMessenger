@@ -6,6 +6,7 @@ import { buildPrompt, parseAgentResult } from "./structured.js";
 import type { AgentProvider, ProviderRunInput, ProviderRunOutput } from "./types.js";
 
 const MAX_SKILL_BYTES = 32 * 1024;
+const MAX_TOOL_CALL_ROUNDS = 4;
 
 function responseMessage(payload: unknown): string {
   if (!payload || typeof payload !== "object") return "";
@@ -178,8 +179,9 @@ export class GatewayProvider implements AgentProvider {
     let usage: TokenUsage | undefined;
     let costUsd: number | undefined;
     let requireToolCall = true;
+    let toolRounds = 0;
 
-    for (let round = 0; round < 4; round += 1) {
+    for (let attempt = 0; attempt < MAX_TOOL_CALL_ROUNDS + 2; attempt += 1) {
       const response = await this.request(`${this.apiBase.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
         headers: {
@@ -190,7 +192,7 @@ export class GatewayProvider implements AgentProvider {
           model: input.model,
           messages,
           tools,
-          ...(requireToolCall ? { tool_choice: round === 0 ? "required" : "auto" } : {}),
+          ...(requireToolCall ? { tool_choice: attempt === 0 ? "required" : "auto" } : {}),
           parallel_tool_calls: false,
         }),
         signal: input.signal,
@@ -214,7 +216,7 @@ export class GatewayProvider implements AgentProvider {
       costUsd = responseCost(payload, response.headers) ?? costUsd;
       const calls = toolCallsFrom(payload);
       if (!calls.length) {
-        if (requireToolCall && round === 0) {
+        if (requireToolCall && attempt === 0) {
           throw new Error("Gateway did not honor the required memory tool call; choose a tool-capable gateway model.");
         }
         const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");
@@ -228,6 +230,10 @@ export class GatewayProvider implements AgentProvider {
             : {}),
         };
       }
+      if (toolRounds >= MAX_TOOL_CALL_ROUNDS) {
+        throw new Error("Gateway exceeded the memory tool-call round limit.");
+      }
+      toolRounds += 1;
       if (calls.length > 4) throw new Error("Gateway requested too many memory tools in one round.");
       const assistant = choiceMessage(payload);
       if (!assistant) throw new Error("Gateway returned tool calls without an assistant message.");
@@ -258,6 +264,6 @@ export class GatewayProvider implements AgentProvider {
         messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
       }
     }
-    throw new Error("Gateway exceeded the memory tool-call round limit.");
+    throw new Error("Gateway completed without a final response.");
   }
 }

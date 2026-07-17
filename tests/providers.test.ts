@@ -299,6 +299,45 @@ describe("provider adapters", () => {
     });
   });
 
+  it("allows a final answer after four tool rounds when a thinking model first rejects tool_choice", async () => {
+    let attempts = 0;
+    const request = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(
+          JSON.stringify({ error: { message: "Thinking mode does not support this tool_choice." } }),
+          { status: 400 },
+        );
+      }
+      if (attempts === 6) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "gateway final after tools" } }] }));
+      }
+      const toolRound = attempts - 1;
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    id: `call-${toolRound}`,
+                    type: "function",
+                    function: { name: "memory_search", arguments: JSON.stringify({ query: `round-${toolRound}` }) },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      );
+    });
+
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
+
+    expect(output.result).toEqual({ message: "gateway final after tools", attachments: [] });
+    expect(request).toHaveBeenCalledTimes(6);
+  });
+
   it("rejects repeated memory tool calls", async () => {
     const toolCall = {
       choices: [
