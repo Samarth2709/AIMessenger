@@ -1,6 +1,11 @@
+import fs from "node:fs";
 import { STATELESS_SESSION_ID, type TokenUsage } from "../types.js";
+import type { GatewayToolDefinition } from "../memory.js";
+import type { AgentSkill } from "../skills.js";
 import { buildPrompt, parseAgentResult } from "./structured.js";
 import type { AgentProvider, ProviderRunInput, ProviderRunOutput } from "./types.js";
+
+const MAX_SKILL_BYTES = 32 * 1024;
 
 function responseMessage(payload: unknown): string {
   if (!payload || typeof payload !== "object") return "";
@@ -71,6 +76,46 @@ function rejectedToolResult(error: unknown): { ok: false; error: { code: string;
   };
 }
 
+function skillToolDefinitions(skills: AgentSkill[]): GatewayToolDefinition[] {
+  if (!skills.length) return [];
+  return [
+    {
+      type: "function",
+      function: {
+        name: "skill_read",
+        description: "Read instructions for one supplied skill by name. This never reads arbitrary host files.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: { name: { type: "string", enum: skills.map((skill) => skill.name) } },
+          required: ["name"],
+        },
+      },
+    },
+  ];
+}
+
+function skillFromInput(skills: AgentSkill[], input: unknown): AgentSkill {
+  if (!input || typeof input !== "object" || Array.isArray(input) || typeof (input as { name?: unknown }).name !== "string") {
+    throw new Error("skill_read requires a supplied skill name.");
+  }
+  const skill = skills.find((candidate) => candidate.name === (input as { name: string }).name);
+  if (!skill) throw new Error("skill_read requested a skill that was not supplied to this job.");
+  return skill;
+}
+
+function skillFromMemoryRead(skills: AgentSkill[], name: string, input: unknown): AgentSkill | undefined {
+  if (name !== "memory_read" || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const requestedPath = (input as { path?: unknown }).path;
+  return typeof requestedPath === "string" ? skills.find((skill) => skill.path === requestedPath) : undefined;
+}
+
+function readSkill(skill: AgentSkill): Record<string, string> {
+  const instructions = fs.readFileSync(skill.path, "utf8");
+  if (Buffer.byteLength(instructions) > MAX_SKILL_BYTES) throw new Error(`Skill is too large: ${skill.name}`);
+  return { name: skill.name, instructions };
+}
+
 function responseUsage(payload: unknown): TokenUsage | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const usage = (payload as { usage?: unknown }).usage;
@@ -122,8 +167,12 @@ export class GatewayProvider implements AgentProvider {
       input.prompt,
       input.memory,
       input.attachmentPaths,
-    );
+    ) +
+      (input.skills.length
+        ? "\n\n<gateway_skill_access>For a listed skill, call skill_read with its name. Do not use memory_read for skill files.</gateway_skill_access>"
+        : "");
     const messages: Array<Record<string, unknown>> = [{ role: "user", content: prompt }];
+    const tools = [...input.memory.toolExecutor.definitions, ...skillToolDefinitions(input.skills)];
     const seenCalls = new Set<string>();
     const rawOutputs: string[] = [];
     let usage: TokenUsage | undefined;
@@ -140,7 +189,7 @@ export class GatewayProvider implements AgentProvider {
         body: JSON.stringify({
           model: input.model,
           messages,
-          tools: input.memory.toolExecutor.definitions,
+          tools,
           ...(requireToolCall ? { tool_choice: round === 0 ? "required" : "auto" } : {}),
           parallel_tool_calls: false,
         }),
@@ -195,7 +244,13 @@ export class GatewayProvider implements AgentProvider {
         seenCalls.add(fingerprint);
         let result: unknown;
         try {
-          result = await input.memory.toolExecutor.execute(call.name, argumentsValue);
+          const skill =
+            call.name === "skill_read"
+              ? skillFromInput(input.skills, argumentsValue)
+              : skillFromMemoryRead(input.skills, call.name, argumentsValue);
+          result = skill
+            ? readSkill(skill)
+            : await input.memory.toolExecutor.execute(call.name, argumentsValue);
         } catch (error) {
           if (input.signal.aborted) throw error;
           result = rejectedToolResult(error);

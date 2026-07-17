@@ -252,6 +252,53 @@ describe("provider adapters", () => {
     });
   });
 
+  it("serves only supplied skill instructions when a gateway model reads a listed skill path", async () => {
+    const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-skill-"));
+    tempDirs.push(skillDir);
+    const skillPath = path.join(skillDir, "SKILL.md");
+    fs.writeFileSync(skillPath, "# Research\n\nUse primary sources.\n");
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  tool_calls: [
+                    {
+                      id: "call-research-skill",
+                      type: "function",
+                      function: { name: "memory_read", arguments: JSON.stringify({ path: skillPath }) },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ choices: [{ message: { content: "gateway used skill" } }] })),
+      );
+
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run({
+      ...baseInput,
+      skills: [{ name: "research", description: "Research current facts.", path: skillPath }],
+    });
+
+    expect(output.result).toEqual({ message: "gateway used skill", attachments: [] });
+    expect(baseInput.memory.toolExecutor.execute).not.toHaveBeenCalledWith("memory_read", { path: skillPath });
+    const retry = JSON.parse(String(request.mock.calls[1]?.[1]?.body)) as {
+      messages: Array<{ role: string; content?: string }>;
+    };
+    const toolMessage = retry.messages.find((message) => message.role === "tool");
+    expect(JSON.parse(toolMessage?.content ?? "{}")).toEqual({
+      name: "research",
+      instructions: "# Research\n\nUse primary sources.\n",
+    });
+  });
+
   it("rejects repeated memory tool calls", async () => {
     const toolCall = {
       choices: [
