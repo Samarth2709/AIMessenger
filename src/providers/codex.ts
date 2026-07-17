@@ -19,7 +19,7 @@ export class CodexProvider implements AgentProvider {
       input.skills,
       input,
       input.prompt,
-      input.context,
+      input.memory,
       input.attachmentPaths,
     );
     const shared = [

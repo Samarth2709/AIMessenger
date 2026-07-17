@@ -1,5 +1,6 @@
 import type { AgentResult, JobMetrics, ProviderName } from "../types.js";
 import type { AgentSkill } from "../skills.js";
+import type { MemoryPromptContext } from "../memory.js";
 
 export interface ProviderRunInput {
   identity: string;
@@ -7,7 +8,7 @@ export interface ProviderRunInput {
   provider: ProviderName;
   model?: string;
   prompt: string;
-  context: string;
+  memory?: MemoryPromptContext;
   attachmentPaths: string[];
   sessionId: string | null;
   workingDirectory: string;

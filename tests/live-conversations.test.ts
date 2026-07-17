@@ -164,4 +164,19 @@ describe("LiveCodexConversationManager", () => {
     await manager.shutdown();
     db.close();
   });
+
+  it("clears the live Codex thread after a valid task handoff", async () => {
+    const { db, manager } = fixture();
+    await manager.start();
+    const { chatId, jobId } = createRunningTurn(db, manager);
+    const final = '{"message":"Task complete.","attachments":[],"session_disposition":"handoff","memory_refs":[]}';
+
+    emit(manager, completed(final));
+    await flush();
+
+    expect(db.getJob(jobId)?.status).toBe("completed");
+    expect(db.getLiveConversation(chatId)?.thread_id).toBeNull();
+    await manager.shutdown();
+    db.close();
+  });
 });

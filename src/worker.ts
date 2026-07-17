@@ -8,6 +8,7 @@ import { prepareResultOutbox } from "./outbound.js";
 import { codexCreditsForUsage } from "./pricing.js";
 import { ProviderRunError, type AgentProvider } from "./providers/types.js";
 import { loadSkills } from "./skills.js";
+import { MemoryService } from "./memory.js";
 import type { ProviderName, RemoteAttachment } from "./types.js";
 import type { TelegramClient } from "./telegram.js";
 
@@ -20,6 +21,7 @@ export class JobWorker {
   private currentJobId?: number;
   private wake?: () => void;
   private acceptingJobs = true;
+  private readonly memory: MemoryService;
 
   constructor(
     private readonly db: AppDatabase,
@@ -27,7 +29,18 @@ export class JobWorker {
     private readonly providers: Record<ProviderName, AgentProvider>,
     private readonly config: Config,
     private readonly logger: AppLogger,
-  ) {}
+    memory?: MemoryService,
+  ) {
+    const dataDir = config.AIMESSENGER_DATA_DIR ?? path.dirname(config.jobsDir);
+    this.memory =
+      memory ??
+      new MemoryService({
+        memoryDir: config.memoryDir ?? path.join(dataDir, "memory"),
+        databasePath: config.databasePath ?? path.join(dataDir, "aimessenger.sqlite"),
+        cliPath: config.memoryCliPath ?? path.join(config.appRoot, "dist", "src", "memory-cli.js"),
+        db,
+      });
+  }
 
   start(): void {
     if (this.active) return;
@@ -191,7 +204,7 @@ export class JobWorker {
         provider: job.provider,
         model,
         prompt: job.prompt,
-        context: this.db.getContext(job.provider, job.user_message_id),
+        memory: this.memory.contextForJob(job.id),
         attachmentPaths,
         sessionId: session.tainted ? null : session.session_id,
         workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
@@ -205,6 +218,12 @@ export class JobWorker {
       }
 
       const outbound = await prepareResultOutbox(output.result, job.chat_id, job.id, this.config);
+      const requestedHandoff = output.result.sessionDisposition === "handoff";
+      const handoff =
+        requestedHandoff && this.memory.verifyHandoffReferences(job.id, output.result.memoryRefs);
+      if (requestedHandoff && !handoff) {
+        this.logger.warn("memory.handoff_rejected", { job_id: job.id, provider: job.provider });
+      }
       const codexCredits =
         job.provider === "codex" && !isGatewayModel(this.config, model)
           ? codexCreditsForUsage(model, output.metrics?.usage)
@@ -213,7 +232,7 @@ export class JobWorker {
         job.id,
         output.result.message,
         job.provider,
-        output.sessionId,
+        handoff ? null : output.sessionId,
         outbound,
         {
           ...output.metrics,

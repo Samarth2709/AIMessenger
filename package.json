@@ -15,7 +15,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "self-update": "tsx scripts/self-update-release.ts",
     "health": "bash scripts/health-check.sh",
-    "telegram:whoami": "tsx scripts/telegram-whoami.ts"
+    "telegram:whoami": "tsx scripts/telegram-whoami.ts",
+    "memory": "tsx src/memory-cli.ts"
   },
   "dependencies": {
     "better-sqlite3": "12.11.1",

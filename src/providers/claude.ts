@@ -21,7 +21,7 @@ export class ClaudeProvider implements AgentProvider {
       input.skills,
       input,
       input.prompt,
-      input.context,
+      input.memory,
       input.attachmentPaths,
     );
     const schema = await fs.readFile(input.schemaPath, "utf8");

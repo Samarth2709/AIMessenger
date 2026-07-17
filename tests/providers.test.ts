@@ -28,7 +28,14 @@ const baseInput = {
   provider: "codex" as const,
   model: "test-model",
   prompt: "hello",
-  context: "",
+  memory: {
+    map: "# Memory index\n\nUse memory tools.",
+    cliCommand: "node /memory-cli.js",
+    toolExecutor: {
+      definitions: [],
+      execute: vi.fn(async () => ({ results: [] })),
+    },
+  },
   attachmentPaths: [],
   sessionId: null,
   workingDirectory: os.tmpdir(),
@@ -75,15 +82,37 @@ describe("provider adapters", () => {
   });
 
   it("calls the AI Security gateway with the selected model", async () => {
-    const request = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          choices: [{ message: { content: "gateway ok" } }],
-          usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 25 }, completion_tokens: 50 },
-        }),
-        { headers: { "x-litellm-response-cost": "0.0042" } },
-      ),
-    );
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "call-1",
+                      type: "function",
+                      function: { name: "memory_search", arguments: '{"query":"hello"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "gateway ok" } }],
+            usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 25 }, completion_tokens: 50 },
+          }),
+          { headers: { "x-litellm-response-cost": "0.0042" } },
+        ),
+      );
     const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
 
     expect(output.result).toEqual({ message: "gateway ok", attachments: [] });
@@ -98,23 +127,131 @@ describe("provider adapters", () => {
         headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
       }),
     );
+    expect(baseInput.memory.toolExecutor.execute).toHaveBeenCalledWith("memory_search", { query: "hello" });
   });
 
   it("does not treat an absent gateway cost header as a zero-dollar charge", async () => {
-    const request = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          choices: [{ message: { content: "gateway ok" } }],
-          usage: { prompt_tokens: 10, completion_tokens: 5 },
-        }),
-      ),
-    );
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  tool_calls: [
+                    {
+                      id: "call-2",
+                      type: "function",
+                      function: { name: "memory_search", arguments: '{"query":"cost"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "gateway ok" } }],
+            usage: { prompt_tokens: 10, completion_tokens: 5 },
+          }),
+        ),
+      );
 
     const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
 
     expect(output.metrics).toEqual({
       usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5 },
     });
+  });
+
+  it("rejects a gateway model that does not honor required memory tools", async () => {
+    const request = vi.fn(async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "gateway ok" } }] })),
+    );
+    await expect(new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput)).rejects.toThrow(
+      "required memory tool call",
+    );
+  });
+
+  it("rejects repeated memory tool calls", async () => {
+    const toolCall = {
+      choices: [
+        {
+          message: {
+            tool_calls: [
+              {
+                id: "call-repeat",
+                type: "function",
+                function: { name: "memory_search", arguments: '{"query":"repeat"}' },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(toolCall)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(toolCall)));
+    await expect(new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput)).rejects.toThrow(
+      "repeated an identical",
+    );
+  });
+
+  it("rejects malformed gateway tool arguments", async () => {
+    const request = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    id: "call-bad",
+                    type: "function",
+                    function: { name: "memory_search", arguments: "not-json" },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    await expect(new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput)).rejects.toThrow(
+      "invalid JSON arguments",
+    );
+  });
+
+  it("bounds gateway memory tool rounds", async () => {
+    let calls = 0;
+    const request = vi.fn(async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    id: `call-${calls}`,
+                    type: "function",
+                    function: { name: "memory_search", arguments: JSON.stringify({ query: `query-${calls}` }) },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      );
+    });
+    await expect(new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput)).rejects.toThrow(
+      "round limit",
+    );
   });
 
   it("routes configured gateway models without changing Codex behavior", async () => {

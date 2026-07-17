@@ -5,7 +5,6 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../src/db.js";
 import { codexCreditsForUsage } from "../src/pricing.js";
-import { STATELESS_SESSION_ID } from "../src/types.js";
 
 const tempDirs: string[] = [];
 
@@ -93,7 +92,7 @@ describe("AppDatabase", () => {
     db.close();
   });
 
-  it("carries unseen cross-provider transcript into a provider", () => {
+  it("keeps cross-provider transcript available only through explicit history retrieval", () => {
     const db = createDb();
     db.recordUpdate(12, 22, 32, 42, "first");
     const firstId = db.enqueueJob({
@@ -114,11 +113,10 @@ describe("AppDatabase", () => {
       prompt: "second",
       attachments: [],
     });
-    const second = db.getJob(secondId)!;
-    const context = db.getContext("claude", second.user_message_id);
-    expect(context).toContain("first");
-    expect(context).toContain("codex answer");
-    expect(context).not.toContain("second");
+    expect(db.getJob(secondId)?.prompt).toBe("second");
+    const match = db.searchHistory("codex answer");
+    expect(match).toHaveLength(1);
+    expect(db.readHistory([match[0]!.id])[0]?.content).toBe("codex answer");
     db.close();
   });
 
@@ -212,7 +210,7 @@ describe("AppDatabase", () => {
     db.close();
   });
 
-  it("does not carry canceled or interrupted prompts into a later unrestricted run", () => {
+  it("taints a provider after a canceled run without replaying transcript context", () => {
     const db = createDb();
     db.recordUpdate(101, 201, 301, 401, "safe completed request");
     const completed = db.enqueueJob({
@@ -239,7 +237,7 @@ describe("AppDatabase", () => {
     db.taintProvider("codex");
 
     db.recordUpdate(103, 203, 301, 401, "new request");
-    const next = db.enqueueJob({
+    db.enqueueJob({
       updateId: 103,
       telegramMessageId: 203,
       chatId: 301,
@@ -247,13 +245,11 @@ describe("AppDatabase", () => {
       prompt: "new request",
       attachments: [],
     });
-    const context = db.getContext("codex", db.getJob(next)!.user_message_id);
-    expect(context).not.toContain("dangerous stopped request");
-    expect(context).toContain("safe answer");
+    expect(db.getProviderSession("codex")).toMatchObject({ session_id: null, tainted: 1 });
     db.close();
   });
 
-  it("honors the explicit new-session transcript boundary", () => {
+  it("resets a native provider session without deleting transcript history", () => {
     const db = createDb();
     db.recordUpdate(111, 211, 311, 411, "old request");
     const old = db.enqueueJob({
@@ -267,7 +263,7 @@ describe("AppDatabase", () => {
     db.completeJob(old, "old answer", "claude", "old-session");
     db.resetProvider("claude");
     db.recordUpdate(112, 212, 311, 411, "fresh request");
-    const fresh = db.enqueueJob({
+    db.enqueueJob({
       updateId: 112,
       telegramMessageId: 212,
       chatId: 311,
@@ -275,11 +271,12 @@ describe("AppDatabase", () => {
       prompt: "fresh request",
       attachments: [],
     });
-    expect(db.getContext("claude", db.getJob(fresh)!.user_message_id)).toBe("");
+    expect(db.getProviderSession("claude")).toMatchObject({ session_id: null, tainted: 0 });
+    expect(db.searchHistory("old answer")).toHaveLength(1);
     db.close();
   });
 
-  it("includes prior completed context for stateless gateway turns", () => {
+  it("keeps stateless gateway transcript available through exact history search", () => {
     const db = createDb();
     db.recordUpdate(113, 213, 311, 411, "first gateway request");
     const first = db.enqueueJob({
@@ -290,9 +287,9 @@ describe("AppDatabase", () => {
       prompt: "first gateway request",
       attachments: [],
     });
-    db.completeJob(first, "first gateway answer", "codex", STATELESS_SESSION_ID);
+    db.completeJob(first, "first gateway answer", "codex", "__aimessenger_stateless__");
     db.recordUpdate(114, 214, 311, 411, "second gateway request");
-    const second = db.enqueueJob({
+    db.enqueueJob({
       updateId: 114,
       telegramMessageId: 214,
       chatId: 311,
@@ -301,9 +298,8 @@ describe("AppDatabase", () => {
       attachments: [],
     });
 
-    const context = db.getContext("codex", db.getJob(second)!.user_message_id);
-    expect(context).toContain("first gateway request");
-    expect(context).toContain("first gateway answer");
+    const match = db.searchHistory("first gateway answer");
+    expect(db.readHistory([match[0]!.id])[0]?.content).toBe("first gateway answer");
     db.close();
   });
 

@@ -26,6 +26,8 @@ export interface AgentAttachment {
 export interface AgentResult {
   message: string;
   attachments: AgentAttachment[];
+  sessionDisposition?: "continue" | "handoff";
+  memoryRefs?: string[];
 }
 
 export interface TokenUsage {

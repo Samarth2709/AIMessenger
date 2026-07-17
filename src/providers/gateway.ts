@@ -21,6 +21,35 @@ function responseMessage(payload: unknown): string {
   return "";
 }
 
+function choiceMessage(payload: unknown): Record<string, unknown> | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const choices = (payload as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return undefined;
+  const message = (choices[0] as { message?: unknown } | undefined)?.message;
+  return message && typeof message === "object" && !Array.isArray(message)
+    ? (message as Record<string, unknown>)
+    : undefined;
+}
+
+function toolCallsFrom(payload: unknown): Array<{ id: string; name: string; arguments: string }> {
+  const raw = choiceMessage(payload)?.tool_calls;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error("Gateway returned malformed tool calls.");
+  return raw.map((call) => {
+    if (!call || typeof call !== "object") throw new Error("Gateway returned malformed tool call.");
+    const record = call as { id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } };
+    if (
+      typeof record.id !== "string" ||
+      record.type !== "function" ||
+      typeof record.function?.name !== "string" ||
+      typeof record.function.arguments !== "string"
+    ) {
+      throw new Error("Gateway returned malformed tool call.");
+    }
+    return { id: record.id, name: record.function.name, arguments: record.function.arguments };
+  });
+}
+
 function errorMessage(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== "object") return fallback;
   const error = (payload as { error?: { message?: unknown } }).error;
@@ -68,46 +97,86 @@ export class GatewayProvider implements AgentProvider {
   async run(input: ProviderRunInput): Promise<ProviderRunOutput> {
     if (!this.apiKey) throw new Error("The AI Security gateway is not configured.");
     if (!input.model) throw new Error("Choose an AI Security gateway model with /model first.");
+    if (!input.memory?.toolExecutor) {
+      throw new Error("Gateway memory tools are unavailable; gateway models must support the memory tool loop.");
+    }
     const prompt = buildPrompt(
       input.identity,
       input.skills,
       input,
       input.prompt,
-      input.context,
+      input.memory,
       input.attachmentPaths,
     );
-    const response = await this.request(`${this.apiBase.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: input.model,
-        messages: [{ role: "user", content: prompt }],
-      }),
-      signal: input.signal,
-    });
-    const rawOutput = await response.text();
-    let payload: unknown = rawOutput;
-    try {
-      payload = JSON.parse(rawOutput);
-    } catch {
-      // Include the raw gateway response below when it is valid completion text.
+    const messages: Array<Record<string, unknown>> = [{ role: "user", content: prompt }];
+    const seenCalls = new Set<string>();
+    const rawOutputs: string[] = [];
+    let usage: TokenUsage | undefined;
+    let costUsd: number | undefined;
+
+    for (let round = 0; round < 4; round += 1) {
+      const response = await this.request(`${this.apiBase.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: input.model,
+          messages,
+          tools: input.memory.toolExecutor.definitions,
+          tool_choice: round === 0 ? "required" : "auto",
+          parallel_tool_calls: false,
+        }),
+        signal: input.signal,
+      });
+      const rawOutput = await response.text();
+      rawOutputs.push(rawOutput);
+      let payload: unknown = rawOutput;
+      try {
+        payload = JSON.parse(rawOutput);
+      } catch {
+        // A non-JSON successful response remains valid only as a final answer without tool calls.
+      }
+      if (!response.ok) {
+        throw new Error(`AI Security gateway failed: ${errorMessage(payload, `HTTP ${response.status}`)}`);
+      }
+      usage = responseUsage(payload) ?? usage;
+      costUsd = responseCost(payload, response.headers) ?? costUsd;
+      const calls = toolCallsFrom(payload);
+      if (!calls.length) {
+        if (round === 0) {
+          throw new Error("Gateway did not honor the required memory tool call; choose a tool-capable gateway model.");
+        }
+        const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");
+        if (!message.trim()) throw new Error("Gateway completed without a final response.");
+        return {
+          result: parseAgentResult(message),
+          sessionId: STATELESS_SESSION_ID,
+          rawOutput: rawOutputs.join("\n"),
+          ...(usage || costUsd !== undefined
+            ? { metrics: { ...(usage ? { usage } : {}), ...(costUsd !== undefined ? { costUsd } : {}) } }
+            : {}),
+        };
+      }
+      if (calls.length > 4) throw new Error("Gateway requested too many memory tools in one round.");
+      const assistant = choiceMessage(payload);
+      if (!assistant) throw new Error("Gateway returned tool calls without an assistant message.");
+      messages.push({ role: "assistant", content: assistant.content ?? "", tool_calls: assistant.tool_calls });
+      for (const call of calls) {
+        let argumentsValue: unknown;
+        try {
+          argumentsValue = JSON.parse(call.arguments);
+        } catch {
+          throw new Error(`Gateway returned invalid JSON arguments for ${call.name}.`);
+        }
+        const fingerprint = `${call.name}:${JSON.stringify(argumentsValue)}`;
+        if (seenCalls.has(fingerprint)) throw new Error("Gateway repeated an identical memory tool call.");
+        seenCalls.add(fingerprint);
+        const result = await input.memory.toolExecutor.execute(call.name, argumentsValue);
+        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+      }
     }
-    if (!response.ok) {
-      throw new Error(`AI Security gateway failed: ${errorMessage(payload, `HTTP ${response.status}`)}`);
-    }
-    const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");
-    const usage = responseUsage(payload);
-    const costUsd = responseCost(payload, response.headers);
-    return {
-      result: parseAgentResult(message),
-      sessionId: STATELESS_SESSION_ID,
-      rawOutput,
-      ...(usage || costUsd !== undefined
-        ? { metrics: { ...(usage ? { usage } : {}), ...(costUsd !== undefined ? { costUsd } : {}) } }
-        : {}),
-    };
+    throw new Error("Gateway exceeded the memory tool-call round limit.");
   }
 }

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { JsonLogger } from "./logger.js";
+import { MemoryService } from "./memory.js";
 import { LiveCodexConversationManager } from "./live-conversations.js";
 import { CombinedModelCatalog, CliModelCatalog, GatewayModelCatalog } from "./models.js";
 import { ClaudeProvider } from "./providers/claude.js";
@@ -24,6 +25,13 @@ async function main(): Promise<void> {
   logger.info("service.starting");
   const release = readReleaseMetadata(config.appRoot);
   const db = new AppDatabase(config.databasePath);
+  const memory = new MemoryService({
+    memoryDir: config.memoryDir,
+    databasePath: config.databasePath,
+    cliPath: config.memoryCliPath,
+    db,
+  });
+  memory.ensureVault();
   const telegram = new TelegramClient(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_API_BASE);
   const gatewayModels = new Set(
     config.GATEWAY_MODELS.split(",").map((model) => model.trim()).filter(Boolean),
@@ -42,6 +50,7 @@ async function main(): Promise<void> {
     },
     config,
     logger,
+    memory,
   );
   const liveCodex = new LiveCodexConversationManager(
     db,
@@ -49,6 +58,7 @@ async function main(): Promise<void> {
     config,
     logger,
     () => worker.notify(),
+    memory,
   );
   const service = new TelegramAgentService(
     db,

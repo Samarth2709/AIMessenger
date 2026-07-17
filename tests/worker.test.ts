@@ -110,6 +110,24 @@ describe("JobWorker", () => {
       "https://example.test/bottest-token-that-is-long-enough/sendMessage",
       expect.any(Object),
     );
+
+    db.recordUpdate(2, 3, 3, 4, "finish the task");
+    const handoffJob = db.enqueueJob({
+      updateId: 2,
+      telegramMessageId: 3,
+      chatId: 3,
+      provider: "codex",
+      prompt: "finish the task",
+      attachments: [],
+    });
+    vi.mocked(provider.run).mockResolvedValueOnce({
+      result: { message: "handed off", attachments: [], sessionDisposition: "handoff", memoryRefs: [] },
+      sessionId: "session-2",
+      rawOutput: "",
+    });
+    worker.notify();
+    await vi.waitFor(() => expect(db.getJob(handoffJob)?.status).toBe("completed"));
+    expect(db.getProviderSession("codex").session_id).toBeNull();
     await worker.shutdown();
     db.close();
   });

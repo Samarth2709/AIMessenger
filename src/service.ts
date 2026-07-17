@@ -209,7 +209,7 @@ export class TelegramAgentService {
       this.logger.info("provider.changed", { provider: command.provider });
       await this.telegram.sendText(
         message.chat.id,
-        `New messages will use ${command.provider}. Context from the other provider will carry across.`,
+        `New messages will use ${command.provider}. Durable memory remains available across providers.`,
       );
       return;
     }

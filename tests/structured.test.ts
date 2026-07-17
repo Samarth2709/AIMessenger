@@ -16,6 +16,19 @@ describe("parseAgentResult", () => {
     ).toEqual({ message: "ok", attachments: [] });
   });
 
+  it("preserves the internal memory handoff fields", () => {
+    expect(
+      parseAgentResult(
+        '{"message":"done","attachments":[],"session_disposition":"handoff","memory_refs":["projects/app/state.md"]}',
+      ),
+    ).toEqual({
+      message: "done",
+      attachments: [],
+      sessionDisposition: "handoff",
+      memoryRefs: ["projects/app/state.md"],
+    });
+  });
+
   it("falls back to plain text", () => {
     expect(parseAgentResult("plain answer")).toEqual({
       message: "plain answer",
@@ -34,7 +47,7 @@ describe("parseAgentResult", () => {
       [],
       { provider: "codex", model: "test-model" },
       "hello",
-      "",
+      undefined,
       [],
     );
     expect(prompt.startsWith("# Iris\nBe direct.")).toBe(true);
@@ -47,11 +60,29 @@ describe("parseAgentResult", () => {
       [{ name: "research", description: "Research current facts.", path: "/skills/research/SKILL.md" }],
       { provider: "codex", model: "test-model" },
       "research this",
-      "",
+      undefined,
       [],
     );
     expect(prompt).toContain("<available_skills>");
     expect(prompt).toContain("Read /skills/research/SKILL.md before using it.");
     expect(prompt).toContain("model: test-model");
+  });
+
+  it("provides a compact vault map instead of transcript context", () => {
+    const prompt = buildPrompt(
+      "# Iris",
+      [],
+      { provider: "codex", model: "test-model" },
+      "continue the project",
+      {
+        map: "# Memory index\n\n## Active projects\n- AIMessenger",
+        cliCommand: "node /memory-cli.js",
+        toolExecutor: { definitions: [], execute: async () => ({}) },
+      },
+      [],
+    );
+    expect(prompt).toContain("<memory_system>");
+    expect(prompt).toContain("# Memory index");
+    expect(prompt).not.toContain("conversation_context");
   });
 });

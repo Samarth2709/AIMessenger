@@ -43,6 +43,8 @@ const schema = z.object({
 export type Config = z.infer<typeof schema> & {
   appRoot: string;
   databasePath: string;
+  memoryDir: string;
+  memoryCliPath: string;
   jobsDir: string;
   logsDir: string;
   identityPath: string;
@@ -61,6 +63,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...parsed,
     appRoot: resolvedRoot,
     databasePath: path.join(parsed.AIMESSENGER_DATA_DIR, "aimessenger.sqlite"),
+    memoryDir: path.join(parsed.AIMESSENGER_DATA_DIR, "memory"),
+    memoryCliPath: path.join(resolvedRoot, "dist", "src", "memory-cli.js"),
     jobsDir: path.join(parsed.AIMESSENGER_DATA_DIR, "jobs"),
     logsDir: path.join(parsed.AIMESSENGER_DATA_DIR, "logs"),
     identityPath: path.join(resolvedRoot, "IDENTITY.md"),

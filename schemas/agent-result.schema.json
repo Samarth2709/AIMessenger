@@ -19,7 +19,17 @@
         },
         "required": ["path", "caption"]
       }
+    },
+    "session_disposition": {
+      "type": "string",
+      "enum": ["continue", "handoff"],
+      "description": "Whether the native provider session must remain available for the immediate next request."
+    },
+    "memory_refs": {
+      "type": "array",
+      "description": "Vault-relative Markdown documents changed during this task, or an empty list when no durable memory was needed.",
+      "items": { "type": "string" }
     }
   },
-  "required": ["message", "attachments"]
+  "required": ["message", "attachments", "session_disposition", "memory_refs"]
 }

@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import {
-  STATELESS_SESSION_ID,
   type CostProviderSummary,
   type CostSummary,
   type JobMetrics,
@@ -167,6 +166,23 @@ export class AppDatabase {
       if (!jobColumns.some((column) => column.name === name)) {
         this.db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${type}`);
       }
+    }
+    const hasTranscriptFts = Boolean(
+      this.db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transcript_fts'")
+        .get(),
+    );
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts
+      USING fts5(content, content = 'transcript', content_rowid = 'id');
+
+      CREATE TRIGGER IF NOT EXISTS transcript_fts_insert
+      AFTER INSERT ON transcript BEGIN
+        INSERT INTO transcript_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+    `);
+    if (!hasTranscriptFts) {
+      this.db.exec("INSERT INTO transcript_fts(transcript_fts) VALUES ('rebuild')");
     }
   }
 
@@ -540,16 +556,17 @@ export class AppDatabase {
     })();
   }
 
-  finishLiveConversation(chatId: number, jobId: number): boolean {
+  finishLiveConversation(chatId: number, jobId: number, clearThread = false): boolean {
     return (
       this.db
         .prepare(
           `UPDATE live_conversations
-           SET state = 'idle', active_turn_id = NULL, active_job_id = NULL,
+           SET state = 'idle', thread_id = CASE WHEN ? THEN NULL ELSE thread_id END,
+             active_turn_id = NULL, active_job_id = NULL,
              steering_count = 0, updated_at = CURRENT_TIMESTAMP
            WHERE chat_id = ? AND active_job_id = ?`,
         )
-        .run(chatId, jobId).changes === 1
+        .run(clearThread ? 1 : 0, chatId, jobId).changes === 1
     );
   }
 
@@ -835,42 +852,69 @@ export class AppDatabase {
       .get(provider) as ProviderSessionRow;
   }
 
-  getContext(provider: ProviderName, beforeMessageId: number): string {
-    const session = this.getProviderSession(provider);
-    const bootstrapContext =
-      session.session_id === STATELESS_SESSION_ID ||
-      (!session.session_id && session.last_message_id === 0) ||
-      session.tainted === 1;
-    const completedUserFilter = `(
-      role != 'user' OR EXISTS (
-        SELECT 1 FROM jobs context_job
-        WHERE context_job.user_message_id = transcript.id AND context_job.status = 'completed'
+  searchHistory(query: string, limit = 5): Array<{
+    id: number;
+    role: string;
+    provider: string | null;
+    created_at: string;
+    snippet: string;
+  }> {
+    const terms = [...new Set(query.toLowerCase().match(/[a-z0-9][a-z0-9._/-]*/g) ?? [])];
+    if (!terms.length) return [];
+    const ftsQuery = terms.map((term) => `"${term.replace(/"/g, "")}"`).join(" AND ");
+    return this.db
+      .prepare(
+        `SELECT transcript.id, transcript.role, transcript.provider, transcript.created_at,
+                snippet(transcript_fts, 0, '[', ']', '…', 16) AS snippet
+         FROM transcript_fts
+         JOIN transcript ON transcript.id = transcript_fts.rowid
+         WHERE transcript_fts MATCH ?
+         ORDER BY bm25(transcript_fts), transcript.id DESC
+         LIMIT ?`,
       )
-    )`;
-    const rows = bootstrapContext
-      ? (this.db
-          .prepare(
-            `SELECT role, provider, content FROM (
-               SELECT id, role, provider, content FROM transcript
-               WHERE id < ? AND ${completedUserFilter} ORDER BY id DESC LIMIT 20
-             ) ORDER BY id`,
-          )
-          .all(beforeMessageId) as Array<{ role: string; provider: string | null; content: string }>)
-      : (this.db
-          .prepare(
-            `SELECT role, provider, content FROM transcript
-             WHERE id > ? AND id < ? AND ${completedUserFilter} ORDER BY id`,
-          )
-          .all(session.last_message_id, beforeMessageId) as Array<{
-          role: string;
-          provider: string | null;
-          content: string;
-        }>);
+      .all(ftsQuery, limit) as Array<{
+      id: number;
+      role: string;
+      provider: string | null;
+      created_at: string;
+      snippet: string;
+    }>;
+  }
 
-    const rendered = rows
-      .map((row) => `${row.role}${row.provider ? ` (${row.provider})` : ""}: ${row.content}`)
-      .join("\n\n");
-    return rendered.length > 20_000 ? rendered.slice(-20_000) : rendered;
+  readHistory(ids: number[], maxChars = 8_000): Array<{
+    id: number;
+    role: string;
+    provider: string | null;
+    created_at: string;
+    content: string;
+    truncated: boolean;
+  }> {
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT id, role, provider, created_at, content
+         FROM transcript WHERE id IN (${placeholders})`,
+      )
+      .all(...ids) as Array<{
+      id: number;
+      role: string;
+      provider: string | null;
+      created_at: string;
+      content: string;
+    }>;
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      if (!row) return [];
+      return [
+        {
+          ...row,
+          content: row.content.slice(0, maxChars),
+          truncated: row.content.length > maxChars,
+        },
+      ];
+    });
   }
 
   private latestTranscriptId(): number {
