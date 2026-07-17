@@ -1,13 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type {
-  JobRow,
-  OutboxInput,
-  OutboxRow,
-  ProviderName,
-  ProviderSessionRow,
-  RemoteAttachment,
+import {
+  STATELESS_SESSION_ID,
+  type JobRow,
+  type LiveConversationRow,
+  type LiveSteerRow,
+  type OutboxInput,
+  type OutboxRow,
+  type ProviderName,
+  type ProviderSessionRow,
+  type RemoteAttachment,
 } from "./types.js";
 
 export class AppDatabase {
@@ -74,6 +77,35 @@ export class AppDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS jobs_status_id ON jobs(status, id);
+
+      CREATE TABLE IF NOT EXISTS live_conversations (
+        chat_id INTEGER PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('idle', 'starting', 'running')),
+        thread_id TEXT,
+        active_turn_id TEXT,
+        active_job_id INTEGER,
+        model TEXT,
+        steering_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(active_job_id) REFERENCES jobs(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS live_steer_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        update_id INTEGER NOT NULL,
+        telegram_message_id INTEGER NOT NULL,
+        transcript_id INTEGER NOT NULL,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'sent')) DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(update_id) REFERENCES inbound_updates(update_id),
+        FOREIGN KEY(transcript_id) REFERENCES transcript(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS live_steer_messages_chat_status_id
+        ON live_steer_messages(chat_id, status, id);
 
       CREATE TABLE IF NOT EXISTS provider_sessions (
         provider TEXT PRIMARY KEY CHECK(provider IN ('codex', 'claude')),
@@ -142,6 +174,17 @@ export class AppDatabase {
 
   setActiveProvider(provider: ProviderName): void {
     this.setSetting("active_provider", provider);
+  }
+
+  getSelectedModel(provider: ProviderName): string | undefined {
+    return this.getSetting(`selected_model_${provider}`);
+  }
+
+  setSelectedModel(provider: ProviderName, model: string): void {
+    this.db.transaction(() => {
+      this.setSetting(`selected_model_${provider}`, model);
+      this.resetProvider(provider);
+    })();
   }
 
   recordAndSetActiveProvider(input: {
@@ -279,6 +322,79 @@ export class AppDatabase {
     })();
   }
 
+  enqueueLiveCodexMessage(input: {
+    updateId: number;
+    telegramMessageId: number;
+    chatId: number;
+    userId: number;
+    prompt: string;
+    body: string;
+    model?: string;
+  }): { fresh: boolean; action: "start" | "steer"; jobId?: number } {
+    return this.db.transaction(() => {
+      const inserted = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO inbound_updates
+            (update_id, telegram_message_id, chat_id, user_id, body)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(input.updateId, input.telegramMessageId, input.chatId, input.userId, input.body);
+      if (inserted.changes === 0) return { fresh: false, action: "steer" as const };
+
+      const message = this.db
+        .prepare("INSERT INTO transcript(role, provider, content) VALUES ('user', NULL, ?)")
+        .run(input.prompt);
+      const transcriptId = Number(message.lastInsertRowid);
+      const conversation = this.getLiveConversation(input.chatId);
+      if (conversation && conversation.state !== "idle") {
+        this.db
+          .prepare(
+            `INSERT INTO live_steer_messages(chat_id, update_id, telegram_message_id, transcript_id, prompt)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(input.chatId, input.updateId, input.telegramMessageId, transcriptId, input.prompt);
+        this.db
+          .prepare(
+            `UPDATE live_conversations
+             SET steering_count = steering_count + 1, updated_at = CURRENT_TIMESTAMP
+             WHERE chat_id = ?`,
+          )
+          .run(input.chatId);
+        return { fresh: true, action: "steer" as const };
+      }
+
+      const job = this.db
+        .prepare(
+          `INSERT INTO jobs
+            (update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, attachments_json, status)
+           VALUES (?, ?, ?, ?, 'codex', ?, '[]', 'running')`,
+        )
+        .run(
+          input.updateId,
+          input.telegramMessageId,
+          input.chatId,
+          transcriptId,
+          input.prompt,
+        );
+      const jobId = Number(job.lastInsertRowid);
+      this.db
+        .prepare(
+          `INSERT INTO live_conversations
+            (chat_id, state, active_turn_id, active_job_id, model, steering_count, updated_at)
+           VALUES (?, 'starting', NULL, ?, ?, 0, CURRENT_TIMESTAMP)
+           ON CONFLICT(chat_id) DO UPDATE SET
+             state = 'starting',
+             active_turn_id = NULL,
+             active_job_id = excluded.active_job_id,
+             model = excluded.model,
+             steering_count = 0,
+             updated_at = CURRENT_TIMESTAMP`,
+        )
+        .run(input.chatId, jobId, input.model ?? null);
+      return { fresh: true, action: "start" as const, jobId };
+    })();
+  }
+
   retryJob(jobId: number, updateId: number, telegramMessageId: number): number | undefined {
     const original = this.getJob(jobId);
     if (!original || !["failed", "canceled", "interrupted"].includes(original.status)) {
@@ -327,6 +443,175 @@ export class AppDatabase {
     return this.db
       .prepare("SELECT * FROM jobs WHERE update_id = ? ORDER BY id DESC LIMIT 1")
       .get(updateId) as JobRow | undefined;
+  }
+
+  getLiveConversation(chatId: number): LiveConversationRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM live_conversations WHERE chat_id = ?")
+      .get(chatId) as LiveConversationRow | undefined;
+  }
+
+  setLiveConversationTurn(
+    chatId: number,
+    jobId: number,
+    threadId: string,
+    turnId: string,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE live_conversations
+           SET state = 'running', thread_id = ?, active_turn_id = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE chat_id = ? AND active_job_id = ?`,
+        )
+        .run(threadId, turnId, chatId, jobId).changes === 1
+    );
+  }
+
+  nextLiveSteer(chatId: number): LiveSteerRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT id, chat_id, update_id, telegram_message_id, transcript_id, prompt, created_at
+         FROM live_steer_messages
+         WHERE chat_id = ? AND status = 'pending'
+         ORDER BY id LIMIT 1`,
+      )
+      .get(chatId) as LiveSteerRow | undefined;
+  }
+
+  markLiveSteerSent(id: number): void {
+    this.db
+      .prepare("UPDATE live_steer_messages SET status = 'sent' WHERE id = ?")
+      .run(id);
+  }
+
+  startPendingLiveFollowup(chatId: number): { jobId?: number } {
+    return this.db.transaction(() => {
+      const conversation = this.getLiveConversation(chatId);
+      if (!conversation || conversation.state !== "idle") return {};
+      const steer = this.nextLiveSteer(chatId);
+      if (!steer) return {};
+      const job = this.db
+        .prepare(
+          `INSERT INTO jobs
+            (update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, attachments_json, status)
+           VALUES (?, ?, ?, ?, 'codex', ?, '[]', 'running')`,
+        )
+        .run(
+          steer.update_id,
+          steer.telegram_message_id,
+          chatId,
+          steer.transcript_id,
+          steer.prompt,
+        );
+      const jobId = Number(job.lastInsertRowid);
+      this.markLiveSteerSent(steer.id);
+      this.db
+        .prepare(
+          `UPDATE live_conversations
+           SET state = 'starting', active_turn_id = NULL, active_job_id = ?,
+             steering_count = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE chat_id = ?`,
+        )
+        .run(jobId, chatId);
+      return { jobId };
+    })();
+  }
+
+  finishLiveConversation(chatId: number, jobId: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE live_conversations
+           SET state = 'idle', active_turn_id = NULL, active_job_id = NULL,
+             steering_count = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE chat_id = ? AND active_job_id = ?`,
+        )
+        .run(chatId, jobId).changes === 1
+    );
+  }
+
+  failLiveConversation(
+    chatId: number,
+    jobId: number,
+    status: "failed" | "canceled",
+    error: string,
+    resetThread = false,
+  ): boolean {
+    return this.db.transaction(() => {
+      const updated = this.db
+        .prepare(
+          `UPDATE live_conversations
+           SET state = 'idle', active_turn_id = NULL, active_job_id = NULL,
+             thread_id = CASE WHEN ? THEN NULL ELSE thread_id END,
+             steering_count = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE chat_id = ? AND active_job_id = ?`,
+        )
+        .run(resetThread ? 1 : 0, chatId, jobId).changes;
+      if (!updated) return false;
+      this.failJob(jobId, status, error);
+      if (resetThread) {
+        this.db.prepare("DELETE FROM live_steer_messages WHERE chat_id = ?").run(chatId);
+        this.taintProvider("codex");
+      }
+      return true;
+    })();
+  }
+
+  resetLiveConversation(
+    chatId: number,
+    taintProvider = true,
+  ): { threadId?: string; turnId?: string; jobId?: number } {
+    return this.db.transaction(() => {
+      const conversation = this.getLiveConversation(chatId);
+      if (!conversation) return {};
+      if (conversation.active_job_id) {
+        this.failJob(conversation.active_job_id, "canceled", "Session reset by user.");
+      }
+      this.db
+        .prepare(
+          `UPDATE live_conversations
+           SET state = 'idle', thread_id = NULL, active_turn_id = NULL, active_job_id = NULL,
+             steering_count = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE chat_id = ?`,
+        )
+        .run(chatId);
+      this.db.prepare("DELETE FROM live_steer_messages WHERE chat_id = ?").run(chatId);
+      if (taintProvider) this.taintProvider("codex");
+      return {
+        ...(conversation.thread_id ? { threadId: conversation.thread_id } : {}),
+        ...(conversation.active_turn_id ? { turnId: conversation.active_turn_id } : {}),
+        ...(conversation.active_job_id ? { jobId: conversation.active_job_id } : {}),
+      };
+    })();
+  }
+
+  recoverLiveConversations(): number {
+    return this.db.transaction(() => {
+      const running = this.db
+        .prepare(
+          `SELECT active_job_id FROM live_conversations
+           WHERE state IN ('starting', 'running') AND active_job_id IS NOT NULL`,
+        )
+        .all() as Array<{ active_job_id: number }>;
+      for (const { active_job_id } of running) {
+        this.failJob(
+          active_job_id,
+          "canceled",
+          "Service restarted while the live Codex turn was running; send a new message to continue.",
+        );
+      }
+      if (running.length) this.taintProvider("codex");
+      this.db
+        .prepare(
+          `UPDATE live_conversations
+           SET state = 'idle', active_turn_id = NULL, active_job_id = NULL,
+             steering_count = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE state IN ('starting', 'running')`,
+        )
+        .run();
+      return running.length;
+    })();
   }
 
   claimNextJob(): JobRow | undefined {
@@ -438,7 +723,9 @@ export class AppDatabase {
   getContext(provider: ProviderName, beforeMessageId: number): string {
     const session = this.getProviderSession(provider);
     const bootstrapContext =
-      (!session.session_id && session.last_message_id === 0) || session.tainted === 1;
+      session.session_id === STATELESS_SESSION_ID ||
+      (!session.session_id && session.last_message_id === 0) ||
+      session.tainted === 1;
     const completedUserFilter = `(
       role != 'user' OR EXISTS (
         SELECT 1 FROM jobs context_job
@@ -478,7 +765,7 @@ export class AppDatabase {
     return row.id;
   }
 
-  status(): { running?: JobRow; queued: number; interrupted: number } {
+  status(): { running?: JobRow; queued: number; interrupted: number; retryable?: JobRow } {
     const running = this.db
       .prepare("SELECT * FROM jobs WHERE status = 'running' ORDER BY id LIMIT 1")
       .get() as JobRow | undefined;
@@ -490,7 +777,14 @@ export class AppDatabase {
          FROM jobs`,
       )
       .get() as { queued: number | null; interrupted: number | null };
-    return { running, queued: counts.queued ?? 0, interrupted: counts.interrupted ?? 0 };
+    const retryable = this.db
+      .prepare(
+        `SELECT * FROM jobs
+         WHERE status IN ('failed', 'canceled', 'interrupted')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get() as JobRow | undefined;
+    return { running, queued: counts.queued ?? 0, interrupted: counts.interrupted ?? 0, retryable };
   }
 
   recordOutbound(telegramMessageId: number, jobId: number | null, kind: string): void {

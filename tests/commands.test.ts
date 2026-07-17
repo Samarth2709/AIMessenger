@@ -14,6 +14,13 @@ describe("parseCommand", () => {
   it("validates reset and retry arguments", () => {
     expect(parseCommand("/new all")).toEqual({ kind: "new", target: "all" });
     expect(parseCommand("/retry 42")).toEqual({ kind: "retry", jobId: 42 });
+    expect(parseCommand("/skills")).toEqual({ kind: "skills" });
+    expect(parseCommand("/updates")).toEqual({ kind: "updates" });
+    expect(parseCommand("/rollback")).toEqual({ kind: "rollback" });
+    expect(parseCommand("/model")).toEqual({ kind: "model" });
+    expect(parseCommand("/model 2")).toEqual({ kind: "model", selection: 2 });
+    expect(parseCommand("/model 2 with context")).toEqual({ kind: "unknown", name: "/model" });
+    expect(parseCommand("/model nope")).toEqual({ kind: "unknown", name: "/model" });
     expect(parseCommand("/retry nope")).toEqual({ kind: "unknown", name: "/retry" });
   });
 });

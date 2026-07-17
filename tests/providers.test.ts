@@ -1,9 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeProvider } from "../src/providers/claude.js";
 import { CodexProvider } from "../src/providers/codex.js";
+import { GatewayProvider } from "../src/providers/gateway.js";
+import { ModelRoutedProvider } from "../src/providers/routed.js";
+import type { AgentProvider } from "../src/providers/types.js";
 
 const tempDirs: string[] = [];
 
@@ -20,6 +23,10 @@ afterEach(() => {
 });
 
 const baseInput = {
+  identity: "You are Iris.",
+  skills: [],
+  provider: "codex" as const,
+  model: "test-model",
   prompt: "hello",
   context: "",
   attachmentPaths: [],
@@ -31,12 +38,19 @@ const baseInput = {
 
 describe("provider adapters", () => {
   it("captures the Codex thread and structured final event", async () => {
+    const argsFile = path.join(os.tmpdir(), `aimessenger-codex-args-${process.pid}.txt`);
     const command = executable(
-      `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-123"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"codex ok\\",\\"attachments\\":[]}"}}'`,
+      `printf '%s\\n' "$@" > "${argsFile}"\n` +
+        `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-123"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"codex ok\\",\\"attachments\\":[]}"}}'`,
     );
     const output = await new CodexProvider(command).run(baseInput);
     expect(output.sessionId).toBe("thread-123");
     expect(output.result).toEqual({ message: "codex ok", attachments: [] });
+    expect(fs.readFileSync(argsFile, "utf8")).toContain("--ignore-user-config");
+    expect(fs.readFileSync(argsFile, "utf8")).toContain("--model");
+    expect(fs.readFileSync(argsFile, "utf8")).toContain("test-model");
+    expect(fs.readFileSync(argsFile, "utf8")).toContain("You are Iris.");
+    fs.rmSync(argsFile, { force: true });
   });
 
   it("captures Claude structured_output and session ID", async () => {
@@ -46,5 +60,41 @@ describe("provider adapters", () => {
     const output = await new ClaudeProvider(command).run(baseInput);
     expect(output.sessionId).toBe("claude-123");
     expect(output.result).toEqual({ message: "claude ok", attachments: [] });
+  });
+
+  it("keeps a malformed Codex structured result empty for retry handling", async () => {
+    const command = executable(
+      `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-empty"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}'`,
+    );
+    const output = await new CodexProvider(command).run(baseInput);
+    expect(output.result).toEqual({ message: "", attachments: [] });
+  });
+
+  it("calls the AI Security gateway with the selected model", async () => {
+    const request = vi.fn(async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "gateway ok" } }] })),
+    );
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
+
+    expect(output.result).toEqual({ message: "gateway ok", attachments: [] });
+    expect(output.sessionId).toBe("__aimessenger_stateless__");
+    expect(request).toHaveBeenCalledWith(
+      "http://gateway.test/v1/chat/completions",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer test-key" }),
+      }),
+    );
+  });
+
+  it("routes configured gateway models without changing Codex behavior", async () => {
+    const codex = { run: vi.fn(async () => ({ result: { message: "codex", attachments: [] }, sessionId: "c", rawOutput: "" })) } satisfies AgentProvider;
+    const gateway = { run: vi.fn(async () => ({ result: { message: "gateway", attachments: [] }, sessionId: "g", rawOutput: "" })) } satisfies AgentProvider;
+    const routed = new ModelRoutedProvider(codex, gateway, new Set(["glm-5.2"]));
+
+    await routed.run({ ...baseInput, model: "glm-5.2" });
+    await routed.run({ ...baseInput, model: "gpt-test" });
+
+    expect(gateway.run).toHaveBeenCalledTimes(1);
+    expect(codex.run).toHaveBeenCalledTimes(1);
   });
 });

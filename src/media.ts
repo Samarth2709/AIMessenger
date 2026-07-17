@@ -1,38 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { RemoteAttachment } from "./types.js";
-import type { TelegramClient, TelegramMessage } from "./telegram.js";
+import type { TelegramClient, TelegramFileReference, TelegramMessage } from "./telegram.js";
 
-const allowedExtensions = new Set([
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".gif",
-  ".webp",
-  ".pdf",
-  ".doc",
-  ".docx",
-  ".pptx",
-  ".xls",
-  ".xlsx",
-  ".txt",
-  ".csv",
-]);
-
-const extensionByMime: Record<string, string> = {
-  "image/png": ".png",
-  "image/jpeg": ".jpg",
-  "image/gif": ".gif",
-  "image/webp": ".webp",
-  "application/pdf": ".pdf",
-  "application/msword": ".doc",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-  "application/vnd.ms-excel": ".xls",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-  "text/plain": ".txt",
-  "text/csv": ".csv",
-};
+const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 
 function safeFileName(name: string): string {
   return path.basename(name).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || "input.bin";
@@ -40,38 +11,40 @@ function safeFileName(name: string): string {
 
 export function extractRemoteAttachments(message: TelegramMessage): RemoteAttachment[] {
   if (message.document) {
-    const document = message.document;
-    const extension = path.extname(document.file_name ?? "").toLowerCase();
-    const inferred = extensionByMime[document.mime_type ?? ""];
-    const selectedExtension = extension || inferred || "";
-    if (!allowedExtensions.has(selectedExtension)) {
-      throw new Error(`Unsupported document type: ${document.file_name ?? document.mime_type ?? "unknown"}`);
-    }
-    if ((document.file_size ?? 0) > 20 * 1024 * 1024) {
-      throw new Error("The document exceeds Telegram's 20 MB bot download limit.");
-    }
-    return [
-      {
-        fileId: document.file_id,
-        fileName: safeFileName(document.file_name ?? `input${selectedExtension}`),
-        mimeType: document.mime_type ?? "application/octet-stream",
-        fileSize: document.file_size ?? 0,
-      },
-    ];
+    return [remoteAttachment(message.document, "input.bin")];
   }
 
   if (message.photo?.length) {
     const photo = message.photo.at(-1)!;
-    return [
-      {
-        fileId: photo.file_id,
-        fileName: "input.jpg",
-        mimeType: "image/jpeg",
-        fileSize: photo.file_size ?? 0,
-      },
-    ];
+    return [remoteAttachment(photo, "input.jpg", "image/jpeg")];
+  }
+  if (message.animation) return [remoteAttachment(message.animation, "input.gif", "image/gif")];
+  if (message.audio) return [remoteAttachment(message.audio, "input.audio", "audio/*")];
+  if (message.video) return [remoteAttachment(message.video, "input.mp4", "video/mp4")];
+  if (message.voice) return [remoteAttachment(message.voice, "input.ogg", "audio/ogg")];
+  if (message.video_note) return [remoteAttachment(message.video_note, "input.mp4", "video/mp4")];
+  if (message.sticker) {
+    const suffix = message.sticker.is_video ? "webm" : message.sticker.is_animated ? "tgs" : "webp";
+    return [remoteAttachment(message.sticker, `input.${suffix}`, "application/octet-stream")];
   }
   return [];
+}
+
+function remoteAttachment(
+  file: TelegramFileReference,
+  fallbackName: string,
+  fallbackMime = "application/octet-stream",
+): RemoteAttachment {
+  const fileSize = file.file_size ?? 0;
+  if (fileSize > MAX_DOWNLOAD_BYTES) {
+    throw new Error("The attachment exceeds Telegram's 20 MB bot download limit.");
+  }
+  return {
+    fileId: file.file_id,
+    fileName: safeFileName(file.file_name ?? fallbackName),
+    mimeType: file.mime_type ?? fallbackMime,
+    fileSize,
+  };
 }
 
 export async function downloadAttachments(
@@ -96,8 +69,6 @@ export async function validateOutboundAttachment(
     ? path.join(process.env.HOME ?? workingDirectory, inputPath.slice(2))
     : inputPath;
   const resolved = path.resolve(workingDirectory, expanded);
-  const extension = path.extname(resolved).toLowerCase();
-  if (!allowedExtensions.has(extension)) throw new Error(`Unsupported attachment type: ${extension}`);
   const stat = await fs.stat(resolved);
   if (!stat.isFile()) throw new Error(`Attachment is not a regular file: ${resolved}`);
   if (stat.size > 50 * 1024 * 1024) throw new Error(`Attachment exceeds 50 MB: ${resolved}`);

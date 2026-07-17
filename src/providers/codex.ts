@@ -1,14 +1,25 @@
 import type { AgentProvider, ProviderRunInput, ProviderRunOutput } from "./types.js";
 import { buildPrompt, parseAgentResult } from "./structured.js";
-import { runProcess } from "./process.js";
+import { ProcessError, runProcess } from "./process.js";
 
 export class CodexProvider implements AgentProvider {
-  constructor(private readonly command = "codex") {}
+  constructor(
+    private readonly command = "codex",
+  ) {}
 
   async run(input: ProviderRunInput): Promise<ProviderRunOutput> {
-    const prompt = buildPrompt(input.prompt, input.context, input.attachmentPaths);
+    const prompt = buildPrompt(
+      input.identity,
+      input.skills,
+      input,
+      input.prompt,
+      input.context,
+      input.attachmentPaths,
+    );
     const shared = [
       "--json",
+      ...(input.model ? ["--model", input.model] : []),
+      "--ignore-user-config",
       "--skip-git-repo-check",
       "--dangerously-bypass-approvals-and-sandbox",
       "--output-schema",
@@ -19,28 +30,36 @@ export class CodexProvider implements AgentProvider {
       : ["exec", ...shared, "-C", input.workingDirectory, prompt];
     let streamedSessionId = input.sessionId;
     let streamBuffer = "";
-    const processResult = await runProcess(
-      this.command,
-      args,
-      input.workingDirectory,
-      input.signal,
-      (chunk) => {
-        streamBuffer += chunk;
-        const lines = streamBuffer.split("\n");
-        streamBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          try {
-            const event = JSON.parse(line) as Record<string, unknown>;
-            if (event.type === "thread.started" && typeof event.thread_id === "string") {
-              streamedSessionId = event.thread_id;
+    let processResult: { stdout: string; stderr: string };
+    try {
+      processResult = await runProcess(
+        this.command,
+        args,
+        input.workingDirectory,
+        input.signal,
+        (chunk) => {
+          streamBuffer += chunk;
+          const lines = streamBuffer.split("\n");
+          streamBuffer = lines.pop() ?? "";
+          for (const line of lines) {
+            try {
+              const event = JSON.parse(line) as Record<string, unknown>;
+              if (event.type === "thread.started" && typeof event.thread_id === "string") {
+                streamedSessionId = event.thread_id;
+              }
+            } catch {
+              // Ignore incomplete or diagnostic lines.
             }
-          } catch {
-            // Ignore incomplete or diagnostic lines.
           }
-        }
-      },
-      input.onProcessStart,
-    );
+        },
+        input.onProcessStart,
+      );
+    } catch (error) {
+      if (error instanceof ProcessError && error.stderr.trim()) {
+        throw new Error(`Codex failed: ${error.stderr.trim().slice(0, 1_000)}`);
+      }
+      throw error;
+    }
 
     let sessionId = streamedSessionId;
     let finalText = "";
@@ -63,7 +82,7 @@ export class CodexProvider implements AgentProvider {
     }
     if (!finalText && errorMessage) throw new Error(`Codex failed: ${errorMessage}`);
     return {
-      result: parseAgentResult(finalText, finalText),
+      result: parseAgentResult(finalText),
       sessionId,
       rawOutput: processResult.stdout,
     };

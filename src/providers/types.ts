@@ -1,6 +1,11 @@
-import type { AgentResult } from "../types.js";
+import type { AgentResult, ProviderName } from "../types.js";
+import type { AgentSkill } from "../skills.js";
 
 export interface ProviderRunInput {
+  identity: string;
+  skills: AgentSkill[];
+  provider: ProviderName;
+  model?: string;
   prompt: string;
   context: string;
   attachmentPaths: string[];

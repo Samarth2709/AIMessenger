@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../src/db.js";
+import { STATELESS_SESSION_ID } from "../src/types.js";
 
 const tempDirs: string[] = [];
 
@@ -99,6 +100,76 @@ describe("AppDatabase", () => {
     db.close();
   });
 
+  it("keeps one live Codex turn open and records later messages as steering", () => {
+    const db = createDb();
+    const first = db.enqueueLiveCodexMessage({
+      updateId: 61,
+      telegramMessageId: 71,
+      chatId: 81,
+      userId: 91,
+      prompt: "first request",
+      body: "first request",
+      model: "gpt-test",
+    });
+    const second = db.enqueueLiveCodexMessage({
+      updateId: 62,
+      telegramMessageId: 72,
+      chatId: 81,
+      userId: 91,
+      prompt: "actually focus on the tests",
+      body: "actually focus on the tests",
+      model: "gpt-test",
+    });
+
+    expect(first).toMatchObject({ fresh: true, action: "start" });
+    expect(second).toEqual({ fresh: true, action: "steer" });
+    expect(db.status().queued).toBe(0);
+    expect(db.getJob(first.jobId!)?.status).toBe("running");
+    expect(db.getLiveConversation(81)).toMatchObject({ state: "starting", active_job_id: first.jobId });
+    expect(db.nextLiveSteer(81)?.prompt).toBe("actually focus on the tests");
+
+    expect(db.setLiveConversationTurn(81, first.jobId!, "thread-1", "turn-1")).toBe(true);
+    const steer = db.nextLiveSteer(81)!;
+    db.markLiveSteerSent(steer.id);
+    expect(db.nextLiveSteer(81)).toBeUndefined();
+    db.close();
+  });
+
+  it("starts a follow-up turn when a message arrives after a live turn completes", () => {
+    const db = createDb();
+    const first = db.enqueueLiveCodexMessage({
+      updateId: 63,
+      telegramMessageId: 73,
+      chatId: 83,
+      userId: 93,
+      prompt: "first request",
+      body: "first request",
+    });
+    db.setLiveConversationTurn(83, first.jobId!, "thread-2", "turn-2");
+    const late = db.enqueueLiveCodexMessage({
+      updateId: 64,
+      telegramMessageId: 74,
+      chatId: 83,
+      userId: 93,
+      prompt: "one more thing",
+      body: "one more thing",
+    });
+    expect(late.action).toBe("steer");
+
+    db.completeJob(first.jobId!, "first result", "codex", "thread-2");
+    db.finishLiveConversation(83, first.jobId!);
+    const followup = db.startPendingLiveFollowup(83);
+
+    expect(followup.jobId).toEqual(expect.any(Number));
+    expect(db.getJob(followup.jobId!)?.prompt).toBe("one more thing");
+    expect(db.getLiveConversation(83)).toMatchObject({
+      state: "starting",
+      active_job_id: followup.jobId,
+      thread_id: "thread-2",
+    });
+    db.close();
+  });
+
   it("does not carry canceled or interrupted prompts into a later unrestricted run", () => {
     const db = createDb();
     db.recordUpdate(101, 201, 301, 401, "safe completed request");
@@ -163,6 +234,34 @@ describe("AppDatabase", () => {
       attachments: [],
     });
     expect(db.getContext("claude", db.getJob(fresh)!.user_message_id)).toBe("");
+    db.close();
+  });
+
+  it("includes prior completed context for stateless gateway turns", () => {
+    const db = createDb();
+    db.recordUpdate(113, 213, 311, 411, "first gateway request");
+    const first = db.enqueueJob({
+      updateId: 113,
+      telegramMessageId: 213,
+      chatId: 311,
+      provider: "codex",
+      prompt: "first gateway request",
+      attachments: [],
+    });
+    db.completeJob(first, "first gateway answer", "codex", STATELESS_SESSION_ID);
+    db.recordUpdate(114, 214, 311, 411, "second gateway request");
+    const second = db.enqueueJob({
+      updateId: 114,
+      telegramMessageId: 214,
+      chatId: 311,
+      provider: "codex",
+      prompt: "second gateway request",
+      attachments: [],
+    });
+
+    const context = db.getContext("codex", db.getJob(second)!.user_message_id);
+    expect(context).toContain("first gateway request");
+    expect(context).toContain("first gateway answer");
     db.close();
   });
 

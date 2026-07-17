@@ -1,16 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
-import path from "node:path";
 import dotenv from "dotenv";
+import { getDefaultEnvFile } from "../src/defaults.js";
 
-const defaultEnv = path.join(
-  os.homedir(),
-  "Library",
-  "Application Support",
-  "AIMessenger",
-  "env",
-);
-const envFile = process.env.AIMESSENGER_ENV_FILE ?? defaultEnv;
+const envFile = process.env.AIMESSENGER_ENV_FILE ?? getDefaultEnvFile(process.platform, process.env, os.homedir());
 if (fs.existsSync(envFile)) dotenv.config({ path: envFile, quiet: true });
 else dotenv.config({ quiet: true });
 

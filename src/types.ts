@@ -1,5 +1,8 @@
 export type ProviderName = "codex" | "claude";
 
+// Stored instead of a native session ID for providers that need full transcript context each turn.
+export const STATELESS_SESSION_ID = "__aimessenger_stateless__";
+
 export type JobStatus =
   | "queued"
   | "running"
@@ -70,4 +73,28 @@ export interface OutboxInput {
   chatId: number;
   kind: "text" | "document";
   payload: { text: string } | { path: string; caption?: string };
+}
+
+export type LiveConversationState = "idle" | "starting" | "running";
+
+export interface LiveConversationRow {
+  chat_id: number;
+  state: LiveConversationState;
+  thread_id: string | null;
+  active_turn_id: string | null;
+  active_job_id: number | null;
+  model: string | null;
+  steering_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LiveSteerRow {
+  id: number;
+  chat_id: number;
+  update_id: number;
+  telegram_message_id: number;
+  transcript_id: number;
+  prompt: string;
+  created_at: string;
 }

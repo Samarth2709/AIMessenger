@@ -1,24 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./common.sh
+source "$SCRIPT_DIR/common.sh"
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DATA_DIR="${AIMESSENGER_DATA_DIR:-$HOME/Library/Application Support/AIMessenger}"
-ENV_FILE="${AIMESSENGER_ENV_FILE:-$DATA_DIR/env}"
+export PATH="$(aimessenger_controlled_path):$PATH"
+
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DATA_DIR="${AIMESSENGER_DATA_DIR:-$(aimessenger_default_data_dir)}"
+ENV_FILE="${AIMESSENGER_ENV_FILE:-$(aimessenger_default_env_file)}"
 LABEL="com.samarth.aimessenger"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 NODE_BIN="$(command -v node)"
 CODEX_BIN="$(command -v codex)"
 CLAUDE_BIN="$(command -v claude)"
-CONTROLLED_PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+CONTROLLED_PATH="$(aimessenger_service_path "$NODE_BIN" "$CODEX_BIN" "$CLAUDE_BIN")"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing secrets file: $ENV_FILE" >&2
   echo "Copy .env.example there, fill in the Telegram values, and chmod 600 it." >&2
   exit 1
 fi
-if [[ "$(stat -f '%Lp' "$ENV_FILE")" != "600" ]]; then
+if [[ "$(aimessenger_file_mode "$ENV_FILE")" != "600" ]]; then
   echo "Secrets file must have mode 600: chmod 600 '$ENV_FILE'" >&2
   exit 1
 fi

@@ -19,17 +19,37 @@ describe("extractRemoteAttachments", () => {
     expect(attachments[0]?.fileId).toBe("large");
   });
 
-  it("rejects unsupported documents", () => {
-    expect(() =>
-      extractRemoteAttachments({
-        ...baseMessage,
-        document: {
-          file_id: "file",
-          file_unique_id: "unique",
-          file_name: "malware.exe",
-          mime_type: "application/octet-stream",
-        },
-      }),
-    ).toThrow(/Unsupported document type/);
+  it("accepts arbitrary document types as files", () => {
+    const attachments = extractRemoteAttachments({
+      ...baseMessage,
+      document: {
+        file_id: "file",
+        file_unique_id: "unique",
+        file_name: "archive.tar.zst",
+        mime_type: "application/zstd",
+      },
+    });
+    expect(attachments).toEqual([
+      expect.objectContaining({ fileId: "file", fileName: "archive.tar.zst", mimeType: "application/zstd" }),
+    ]);
+  });
+
+  it("accepts audio, video, voice, animation, video notes, and stickers", () => {
+    const variants: TelegramMessage[] = [
+      { ...baseMessage, audio: { file_id: "audio", file_unique_id: "a" } },
+      { ...baseMessage, video: { file_id: "video", file_unique_id: "v" } },
+      { ...baseMessage, voice: { file_id: "voice", file_unique_id: "o" } },
+      { ...baseMessage, animation: { file_id: "animation", file_unique_id: "n" } },
+      { ...baseMessage, video_note: { file_id: "note", file_unique_id: "t" } },
+      { ...baseMessage, sticker: { file_id: "sticker", file_unique_id: "s", is_animated: true } },
+    ];
+    expect(variants.map((message) => extractRemoteAttachments(message)[0]?.fileId)).toEqual([
+      "audio",
+      "video",
+      "voice",
+      "animation",
+      "note",
+      "sticker",
+    ]);
   });
 });

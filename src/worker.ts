@@ -1,12 +1,16 @@
-import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
-import { chunkText } from "./chunk.js";
-import type { Config } from "./config.js";
+import { getProviderModel, type Config } from "./config.js";
 import type { AppDatabase } from "./db.js";
-import { downloadAttachments, validateOutboundAttachment } from "./media.js";
+import type { AppLogger } from "./logger.js";
+import { downloadAttachments } from "./media.js";
+import { prepareResultOutbox } from "./outbound.js";
 import type { AgentProvider } from "./providers/types.js";
-import type { OutboxInput, ProviderName, RemoteAttachment } from "./types.js";
+import { loadSkills } from "./skills.js";
+import type { ProviderName, RemoteAttachment } from "./types.js";
 import type { TelegramClient } from "./telegram.js";
+
+const TYPING_REFRESH_MS = 4_000;
 
 export class JobWorker {
   private active = false;
@@ -14,12 +18,14 @@ export class JobWorker {
   private currentAbort?: AbortController;
   private currentJobId?: number;
   private wake?: () => void;
+  private acceptingJobs = true;
 
   constructor(
     private readonly db: AppDatabase,
     private readonly telegram: TelegramClient,
     private readonly providers: Record<ProviderName, AgentProvider>,
     private readonly config: Config,
+    private readonly logger: AppLogger,
   ) {}
 
   start(): void {
@@ -27,15 +33,18 @@ export class JobWorker {
     for (const pid of this.db.runningProcessPids()) {
       try {
         process.kill(-pid, "SIGKILL");
-        console.warn(`Killed orphaned agent process group ${pid}.`);
+        this.logger.warn("worker.orphan_process_killed", { process_pid: pid });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
     const recovered = this.db.recoverInterruptedJobs();
-    if (recovered) console.warn(`Marked ${recovered} previously running job(s) interrupted.`);
-    this.db.recoverOutbox();
+    if (recovered) this.logger.warn("job.recovered_interrupted", { count: recovered });
+    const recoveredOutbox = this.db.recoverOutbox();
+    if (recoveredOutbox) this.logger.warn("outbox.recovered", { count: recoveredOutbox });
     this.active = true;
+    this.acceptingJobs = true;
+    this.logger.info("worker.started");
     this.loopPromise = this.runLoop();
   }
 
@@ -47,6 +56,11 @@ export class JobWorker {
   }
 
   notify(): void {
+    this.wake?.();
+  }
+
+  pause(): void {
+    this.acceptingJobs = false;
     this.wake?.();
   }
 
@@ -78,6 +92,10 @@ export class JobWorker {
         await this.deliverOutbox(outbound);
         continue;
       }
+      if (!this.acceptingJobs) {
+        await this.waitForWork();
+        continue;
+      }
       const job = this.db.claimNextJob();
       if (!job) {
         await this.waitForWork();
@@ -85,6 +103,8 @@ export class JobWorker {
       }
       this.currentJobId = job.id;
       this.currentAbort = new AbortController();
+      const startedAt = Date.now();
+      this.logger.info("job.started", { job_id: job.id, provider: job.provider });
       const timeout = setTimeout(
         () => this.currentAbort?.abort(),
         this.config.JOB_TIMEOUT_MINUTES * 60_000,
@@ -92,16 +112,32 @@ export class JobWorker {
       timeout.unref();
 
       try {
-        await this.processJob(job.id, this.currentAbort.signal);
+        const result = await this.processJob(job.id, this.currentAbort.signal);
+        this.logger.info("job.completed", {
+          job_id: job.id,
+          provider: job.provider,
+          duration_ms: Date.now() - startedAt,
+          ...result,
+        });
       } catch (error) {
         const canceled = this.currentAbort.signal.aborted;
         const message = error instanceof Error ? error.message : String(error);
         this.db.failJob(job.id, canceled ? "canceled" : "failed", message);
         this.db.taintProvider(job.provider);
+        const context = {
+          job_id: job.id,
+          provider: job.provider,
+          duration_ms: Date.now() - startedAt,
+        };
+        if (canceled) {
+          this.logger.warn("job.canceled", context);
+        } else {
+          this.logger.error("job.failed", error, context);
+        }
         if (!canceled) {
           await this.safeSend(
             job.chat_id,
-            `Job #${job.id} failed: ${message}\nUse /retry ${job.id} to try it again.`,
+            `Your request failed: ${message}\nUse /status to view recovery options.`,
             job.id,
           );
         }
@@ -113,67 +149,84 @@ export class JobWorker {
     }
   }
 
-  private async processJob(jobId: number, signal: AbortSignal): Promise<void> {
+  private async processJob(
+    jobId: number,
+    signal: AbortSignal,
+  ): Promise<{
+    attachment_count: number;
+    outbound_count: number;
+    result_length: number;
+    skill_count: number;
+  }> {
     const job = this.db.getJob(jobId);
     if (!job) throw new Error(`Job ${jobId} disappeared.`);
-    await this.telegram.sendTyping(job.chat_id).catch(() => undefined);
-
-    const remoteAttachments = JSON.parse(job.attachments_json) as RemoteAttachment[];
-    const jobDir = path.join(this.config.jobsDir, String(job.id));
-    const attachmentPaths = await downloadAttachments(
-      this.telegram,
-      remoteAttachments,
-      jobDir,
-    );
-    const session = this.db.getProviderSession(job.provider);
-    const output = await this.providers[job.provider].run({
-      prompt: job.prompt,
-      context: this.db.getContext(job.provider, job.user_message_id),
-      attachmentPaths,
-      sessionId: session.tainted ? null : session.session_id,
-      workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
-      schemaPath: path.join(this.config.appRoot, "schemas", "agent-result.schema.json"),
-      signal,
-      onProcessStart: (pid) => this.db.setJobProcessPid(job.id, pid),
-    });
-    if (signal.aborted) throw new DOMException("Job canceled.", "AbortError");
-
-    const outbound: OutboxInput[] = chunkText(output.result.message).map((text) => ({
-      chatId: job.chat_id,
-      kind: "text",
-      payload: { text },
-    }));
-    for (const attachment of output.result.attachments) {
-      try {
-        const validated = await validateOutboundAttachment(
-          attachment.path,
-          this.config.AIMESSENGER_WORKING_DIR,
-        );
-        const outputDir = path.join(jobDir, "output");
-        await fs.mkdir(outputDir, { recursive: true, mode: 0o700 });
-        const durablePath = path.join(
-          outputDir,
-          `${outbound.length + 1}-${path.basename(validated)}`,
-        );
-        await fs.copyFile(validated, durablePath);
-        await fs.chmod(durablePath, 0o600);
-        outbound.push({
-          chatId: job.chat_id,
-          kind: "document",
-          payload: { path: durablePath, ...(attachment.caption ? { caption: attachment.caption } : {}) },
-        });
-      } catch (error) {
-        outbound.push({
-          chatId: job.chat_id,
-          kind: "text",
-          payload: {
-            text: `Could not prepare attachment ${attachment.path}: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        });
+    const typing = await this.startTyping(job.chat_id);
+    try {
+      const identity = fsSync.readFileSync(this.config.identityPath, "utf8").trim();
+      if (!identity) throw new Error(`Identity file is empty: ${this.config.identityPath}`);
+      const skills = loadSkills(this.config.skillsDir);
+      if (skills.rejected) this.logger.warn("skills.rejected", { count: skills.rejected });
+      const remoteAttachments = JSON.parse(job.attachments_json) as RemoteAttachment[];
+      const jobDir = path.join(this.config.jobsDir, String(job.id));
+      const attachmentPaths = await downloadAttachments(
+        this.telegram,
+        remoteAttachments,
+        jobDir,
+      );
+      const session = this.db.getProviderSession(job.provider);
+      const output = await this.providers[job.provider].run({
+        identity,
+        skills: skills.skills,
+        provider: job.provider,
+        model: getProviderModel(
+          this.config,
+          job.provider,
+          this.db.getSelectedModel(job.provider),
+        ),
+        prompt: job.prompt,
+        context: this.db.getContext(job.provider, job.user_message_id),
+        attachmentPaths,
+        sessionId: session.tainted ? null : session.session_id,
+        workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
+        schemaPath: path.join(this.config.appRoot, "schemas", "agent-result.schema.json"),
+        signal,
+        onProcessStart: (pid) => this.db.setJobProcessPid(job.id, pid),
+      });
+      if (signal.aborted) throw new DOMException("Job canceled.", "AbortError");
+      if (!output.result.message.trim() && output.result.attachments.length === 0) {
+        throw new Error("Agent completed without a message or attachment.");
       }
+
+      const outbound = await prepareResultOutbox(output.result, job.chat_id, job.id, this.config);
+      this.db.completeJob(job.id, output.result.message, job.provider, output.sessionId, outbound);
+      this.notify();
+      return {
+        attachment_count: remoteAttachments.length,
+        outbound_count: outbound.length,
+        result_length: output.result.message.length,
+        skill_count: skills.skills.length,
+      };
+    } finally {
+      clearInterval(typing);
     }
-    this.db.completeJob(job.id, output.result.message, job.provider, output.sessionId, outbound);
-    this.notify();
+  }
+
+  private async startTyping(chatId: number): Promise<NodeJS.Timeout> {
+    await this.sendTyping(chatId, "initial");
+    const interval = setInterval(() => {
+      void this.sendTyping(chatId, "refresh");
+    }, TYPING_REFRESH_MS);
+    interval.unref();
+    return interval;
+  }
+
+  private async sendTyping(chatId: number, phase: "initial" | "refresh"): Promise<void> {
+    try {
+      await this.telegram.sendTyping(chatId);
+      this.logger.info("telegram.typing_sent", { phase });
+    } catch (error) {
+      this.logger.error("telegram.typing_failed", error, { phase });
+    }
   }
 
   private async deliverOutbox(outbox: import("./types.js").OutboxRow): Promise<void> {
@@ -193,8 +246,20 @@ export class JobWorker {
       }
       this.db.completeOutbox(outbox.id, telegramMessageId);
       this.db.recordOutbound(telegramMessageId, outbox.job_id, outbox.kind);
+      this.logger.info("telegram.delivery_sent", {
+        outbox_id: outbox.id,
+        job_id: outbox.job_id,
+        kind: outbox.kind,
+        attempt: outbox.attempts + 1,
+      });
     } catch (error) {
       this.db.retryOutbox(outbox.id, error instanceof Error ? error.message : String(error));
+      this.logger.error("telegram.delivery_failed", error, {
+        outbox_id: outbox.id,
+        job_id: outbox.job_id,
+        kind: outbox.kind,
+        next_attempt: outbox.attempts + 1,
+      });
     }
   }
 
@@ -203,7 +268,7 @@ export class JobWorker {
       const ids = await this.telegram.sendText(chatId, text, jobId);
       for (const id of ids) this.db.recordOutbound(id, jobId, "text");
     } catch (error) {
-      console.error("Telegram send failed", error);
+      this.logger.error("telegram.failure_notice_failed", error, { job_id: jobId });
     }
   }
 }
