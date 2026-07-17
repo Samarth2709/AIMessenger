@@ -477,6 +477,13 @@ export class AppDatabase {
     return this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(id) as JobRow | undefined;
   }
 
+  getInboundUpdateBody(updateId: number): string | undefined {
+    const row = this.db
+      .prepare("SELECT body FROM inbound_updates WHERE update_id = ?")
+      .get(updateId) as { body: string } | undefined;
+    return row?.body;
+  }
+
   getJobByUpdate(updateId: number): JobRow | undefined {
     return this.db
       .prepare("SELECT * FROM jobs WHERE update_id = ? ORDER BY id DESC LIMIT 1")

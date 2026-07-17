@@ -77,6 +77,7 @@ describe("parseAgentResult", () => {
       {
         map: "# Memory index\n\n## Active projects\n- AIMessenger",
         cliCommand: "node /memory-cli.js",
+        userSource: "inbound_update:42",
         toolExecutor: { definitions: [], execute: async () => ({}) },
       },
       [],
@@ -84,6 +85,8 @@ describe("parseAgentResult", () => {
     expect(prompt).toContain("<memory_system>");
     expect(prompt).toContain("# Memory index");
     expect(prompt).toContain("never skill or host file paths");
+    expect(prompt).toContain("inbound_update:42");
+    expect(prompt).toContain("Never write task requests");
     expect(prompt).not.toContain("conversation_context");
   });
 });

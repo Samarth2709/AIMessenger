@@ -31,6 +31,7 @@ const baseInput = {
   memory: {
     map: "# Memory index\n\nUse memory tools.",
     cliCommand: "node /memory-cli.js",
+    userSource: "inbound_update:1",
     toolExecutor: {
       definitions: [],
       execute: vi.fn(async () => ({ results: [] })),

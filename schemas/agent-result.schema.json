@@ -27,7 +27,7 @@
     },
     "memory_refs": {
       "type": "array",
-      "description": "Vault-relative Markdown documents changed during this task, or an empty list when no durable memory was needed.",
+      "description": "Changed core/profile.md or core/preferences.md path, or an empty list when no direct user memory was needed.",
       "items": { "type": "string" }
     }
   },
