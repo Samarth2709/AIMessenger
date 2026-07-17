@@ -56,6 +56,10 @@ function errorMessage(payload: unknown, fallback: string): string {
   return typeof error?.message === "string" ? error.message : fallback;
 }
 
+function rejectsToolChoice(payload: unknown): boolean {
+  return /does not support (?:this )?tool_choice/i.test(errorMessage(payload, ""));
+}
+
 function responseUsage(payload: unknown): TokenUsage | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const usage = (payload as { usage?: unknown }).usage;
@@ -113,6 +117,7 @@ export class GatewayProvider implements AgentProvider {
     const rawOutputs: string[] = [];
     let usage: TokenUsage | undefined;
     let costUsd: number | undefined;
+    let requireToolCall = true;
 
     for (let round = 0; round < 4; round += 1) {
       const response = await this.request(`${this.apiBase.replace(/\/$/, "")}/chat/completions`, {
@@ -125,7 +130,7 @@ export class GatewayProvider implements AgentProvider {
           model: input.model,
           messages,
           tools: input.memory.toolExecutor.definitions,
-          tool_choice: round === 0 ? "required" : "auto",
+          ...(requireToolCall ? { tool_choice: round === 0 ? "required" : "auto" } : {}),
           parallel_tool_calls: false,
         }),
         signal: input.signal,
@@ -139,13 +144,17 @@ export class GatewayProvider implements AgentProvider {
         // A non-JSON successful response remains valid only as a final answer without tool calls.
       }
       if (!response.ok) {
+        if (requireToolCall && rejectsToolChoice(payload)) {
+          requireToolCall = false;
+          continue;
+        }
         throw new Error(`AI Security gateway failed: ${errorMessage(payload, `HTTP ${response.status}`)}`);
       }
       usage = responseUsage(payload) ?? usage;
       costUsd = responseCost(payload, response.headers) ?? costUsd;
       const calls = toolCallsFrom(payload);
       if (!calls.length) {
-        if (round === 0) {
+        if (requireToolCall && round === 0) {
           throw new Error("Gateway did not honor the required memory tool call; choose a tool-capable gateway model.");
         }
         const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");

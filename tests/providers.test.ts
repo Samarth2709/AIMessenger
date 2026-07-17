@@ -177,6 +177,30 @@ describe("provider adapters", () => {
     );
   });
 
+  it("retries without tool_choice when a thinking model rejects that field", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: { message: "Thinking mode does not support this tool_choice." },
+          }),
+          { status: 400 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ choices: [{ message: { content: "gateway fallback ok" } }] })),
+      );
+
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
+
+    expect(output.result).toEqual({ message: "gateway fallback ok", attachments: [] });
+    expect(request).toHaveBeenCalledTimes(2);
+    const retry = JSON.parse(String(request.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(retry).not.toHaveProperty("tool_choice");
+    expect(retry).toHaveProperty("tools");
+  });
+
   it("rejects repeated memory tool calls", async () => {
     const toolCall = {
       choices: [
