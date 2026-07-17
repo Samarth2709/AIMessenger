@@ -83,6 +83,7 @@ describe("parseAgentResult", () => {
     );
     expect(prompt).toContain("<memory_system>");
     expect(prompt).toContain("# Memory index");
+    expect(prompt).toContain("never skill or host file paths");
     expect(prompt).not.toContain("conversation_context");
   });
 });

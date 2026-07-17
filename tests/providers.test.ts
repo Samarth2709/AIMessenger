@@ -201,6 +201,57 @@ describe("provider adapters", () => {
     expect(retry).toHaveProperty("tools");
   });
 
+  it("returns a rejected memory tool result to the gateway model instead of aborting the request", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  tool_calls: [
+                    {
+                      id: "call-skill-path",
+                      type: "function",
+                      function: { name: "memory_read", arguments: '{"path":"/srv/skills/research/SKILL.md"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ choices: [{ message: { content: "gateway recovered" } }] })),
+      );
+    const toolExecutor = {
+      definitions: [],
+      execute: vi.fn(async () => {
+        throw new Error("Memory path is outside the permitted Markdown hierarchy.");
+      }),
+    };
+
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run({
+      ...baseInput,
+      memory: { ...baseInput.memory, toolExecutor },
+    });
+
+    expect(output.result).toEqual({ message: "gateway recovered", attachments: [] });
+    const retry = JSON.parse(String(request.mock.calls[1]?.[1]?.body)) as {
+      messages: Array<{ role: string; content?: string }>;
+    };
+    const toolMessage = retry.messages.find((message) => message.role === "tool");
+    expect(JSON.parse(toolMessage?.content ?? "{}")).toEqual({
+      ok: false,
+      error: {
+        code: "memory_tool_rejected",
+        message: "Memory path is outside the permitted Markdown hierarchy. Memory tools can access only the Markdown vault, not skill or host files.",
+      },
+    });
+  });
+
   it("rejects repeated memory tool calls", async () => {
     const toolCall = {
       choices: [

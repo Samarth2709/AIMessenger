@@ -60,6 +60,17 @@ function rejectsToolChoice(payload: unknown): boolean {
   return /does not support (?:this )?tool_choice/i.test(errorMessage(payload, ""));
 }
 
+function rejectedToolResult(error: unknown): { ok: false; error: { code: string; message: string } } {
+  const message = error instanceof Error ? error.message : "Memory tool request failed.";
+  return {
+    ok: false,
+    error: {
+      code: "memory_tool_rejected",
+      message: `${message.slice(0, 500)} Memory tools can access only the Markdown vault, not skill or host files.`,
+    },
+  };
+}
+
 function responseUsage(payload: unknown): TokenUsage | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const usage = (payload as { usage?: unknown }).usage;
@@ -182,7 +193,13 @@ export class GatewayProvider implements AgentProvider {
         const fingerprint = `${call.name}:${JSON.stringify(argumentsValue)}`;
         if (seenCalls.has(fingerprint)) throw new Error("Gateway repeated an identical memory tool call.");
         seenCalls.add(fingerprint);
-        const result = await input.memory.toolExecutor.execute(call.name, argumentsValue);
+        let result: unknown;
+        try {
+          result = await input.memory.toolExecutor.execute(call.name, argumentsValue);
+        } catch (error) {
+          if (input.signal.aborted) throw error;
+          result = rejectedToolResult(error);
+        }
         messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
       }
     }

@@ -607,7 +607,7 @@ export class MemoryService {
 }
 
 export function memoryToolDefinitions(): GatewayToolDefinition[] {
-  const path = { type: "string", description: "Vault-relative Markdown path returned by memory search/read." };
+  const path = { type: "string", description: "Vault-relative Markdown memory path only; never an absolute skill or host file path." };
   const document = { type: "string", description: "Complete replacement Markdown document with required front matter and final newline." };
   return [
     {
