@@ -1,4 +1,4 @@
-import type { AgentResult, ProviderName } from "../types.js";
+import type { AgentResult, JobMetrics, ProviderName } from "../types.js";
 import type { AgentSkill } from "../skills.js";
 
 export interface ProviderRunInput {
@@ -20,6 +20,16 @@ export interface ProviderRunOutput {
   result: AgentResult;
   sessionId: string | null;
   rawOutput: string;
+  metrics?: JobMetrics;
+}
+
+export class ProviderRunError extends Error {
+  constructor(
+    message: string,
+    readonly metrics?: JobMetrics,
+  ) {
+    super(message);
+  }
 }
 
 export interface AgentProvider {

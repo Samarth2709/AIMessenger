@@ -232,6 +232,38 @@ describe("TelegramAgentService", () => {
     db.close();
   });
 
+  it("reports provider cost and Codex token usage", async () => {
+    const { service, db, sent } = fixture();
+    db.recordUpdate(14, 140, 123, 123, "costed Claude work");
+    const claude = db.enqueueJob({
+      updateId: 14,
+      telegramMessageId: 140,
+      chatId: 123,
+      provider: "claude",
+      prompt: "costed Claude work",
+      attachments: [],
+    });
+    db.completeJob(claude, "done", "claude", "claude-session", [], { costUsd: 0.0125 });
+
+    db.recordUpdate(15, 150, 123, 123, "metered Codex work");
+    const codex = db.enqueueJob({
+      updateId: 15,
+      telegramMessageId: 150,
+      chatId: 123,
+      provider: "codex",
+      prompt: "metered Codex work",
+      attachments: [],
+    });
+    db.completeJob(codex, "done", "codex", "codex-session", [], {
+      usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+    });
+
+    await handle(service, update(16, "/cost"));
+    expect(sent.at(-1)).toContain("Today: $0.0125 reported across 2 runs; 1 without a dollar figure");
+    expect(sent.at(-1)).toContain("Codex and gateway tokens (All time; no dollar amount is available): 100 input, 25 cached input, 50 output");
+    db.close();
+  });
+
   it("advances the persisted long-poll offset after handling an update", async () => {
     const { service, db, telegram } = fixture();
     let call = 0;

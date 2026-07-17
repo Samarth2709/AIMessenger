@@ -1,4 +1,4 @@
-import { STATELESS_SESSION_ID } from "../types.js";
+import { STATELESS_SESSION_ID, type TokenUsage } from "../types.js";
 import { buildPrompt, parseAgentResult } from "./structured.js";
 import type { AgentProvider, ProviderRunInput, ProviderRunOutput } from "./types.js";
 
@@ -25,6 +25,27 @@ function errorMessage(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== "object") return fallback;
   const error = (payload as { error?: { message?: unknown } }).error;
   return typeof error?.message === "string" ? error.message : fallback;
+}
+
+function responseUsage(payload: unknown): TokenUsage | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const usage = (payload as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== "object") return undefined;
+  const record = usage as Record<string, unknown>;
+  const promptDetails =
+    record.prompt_tokens_details && typeof record.prompt_tokens_details === "object"
+      ? (record.prompt_tokens_details as Record<string, unknown>)
+      : {};
+  const inputTokens = numberAt(record.input_tokens) ?? numberAt(record.prompt_tokens) ?? 0;
+  const cachedInputTokens =
+    numberAt(record.cached_input_tokens) ?? numberAt(promptDetails.cached_tokens) ?? 0;
+  const outputTokens = numberAt(record.output_tokens) ?? numberAt(record.completion_tokens) ?? 0;
+  if (inputTokens === 0 && cachedInputTokens === 0 && outputTokens === 0) return undefined;
+  return { inputTokens, cachedInputTokens, outputTokens };
+}
+
+function numberAt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 export class GatewayProvider implements AgentProvider {
@@ -68,10 +89,12 @@ export class GatewayProvider implements AgentProvider {
       throw new Error(`AI Security gateway failed: ${errorMessage(payload, `HTTP ${response.status}`)}`);
     }
     const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");
+    const usage = responseUsage(payload);
     return {
       result: parseAgentResult(message),
       sessionId: STATELESS_SESSION_ID,
       rawOutput,
+      ...(usage ? { metrics: { usage } } : {}),
     };
   }
 }

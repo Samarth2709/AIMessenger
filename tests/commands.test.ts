@@ -23,6 +23,13 @@ describe("parseCommand", () => {
     expect(parseCommand("/model nope")).toEqual({ kind: "unknown", name: "/model" });
     expect(parseCommand("/retry nope")).toEqual({ kind: "unknown", name: "/retry" });
   });
+
+  it("parses cost windows", () => {
+    expect(parseCommand("/cost")).toEqual({ kind: "cost", window: "summary" });
+    expect(parseCommand("/cost all")).toEqual({ kind: "cost", window: "all" });
+    expect(parseCommand("/cost 30")).toEqual({ kind: "cost", window: "days", days: 30 });
+    expect(parseCommand("/cost 0")).toEqual({ kind: "unknown", name: "/cost" });
+  });
 });
 
 describe("chunkText", () => {

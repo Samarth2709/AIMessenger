@@ -5,7 +5,7 @@ import type { AppDatabase } from "./db.js";
 import type { AppLogger } from "./logger.js";
 import { downloadAttachments } from "./media.js";
 import { prepareResultOutbox } from "./outbound.js";
-import type { AgentProvider } from "./providers/types.js";
+import { ProviderRunError, type AgentProvider } from "./providers/types.js";
 import { loadSkills } from "./skills.js";
 import type { ProviderName, RemoteAttachment } from "./types.js";
 import type { TelegramClient } from "./telegram.js";
@@ -122,7 +122,12 @@ export class JobWorker {
       } catch (error) {
         const canceled = this.currentAbort.signal.aborted;
         const message = error instanceof Error ? error.message : String(error);
-        this.db.failJob(job.id, canceled ? "canceled" : "failed", message);
+        this.db.failJob(
+          job.id,
+          canceled ? "canceled" : "failed",
+          message,
+          error instanceof ProviderRunError ? error.metrics : undefined,
+        );
         this.db.taintProvider(job.provider);
         const context = {
           job_id: job.id,
@@ -198,7 +203,14 @@ export class JobWorker {
       }
 
       const outbound = await prepareResultOutbox(output.result, job.chat_id, job.id, this.config);
-      this.db.completeJob(job.id, output.result.message, job.provider, output.sessionId, outbound);
+      this.db.completeJob(
+        job.id,
+        output.result.message,
+        job.provider,
+        output.sessionId,
+        outbound,
+        output.metrics,
+      );
       this.notify();
       return {
         attachment_count: remoteAttachments.length,

@@ -8,6 +8,7 @@ import { prepareResultOutbox } from "./outbound.js";
 import { parseAgentResult, buildPrompt } from "./providers/structured.js";
 import { loadSkills } from "./skills.js";
 import type { TelegramClient } from "./telegram.js";
+import type { TokenUsage } from "./types.js";
 
 const TYPING_REFRESH_MS = 4_000;
 const FIRST_MESSAGE_GRACE_MS = 250;
@@ -56,6 +57,26 @@ function agentMessageFromItems(value: unknown): string | undefined {
     if (record?.type === "agentMessage" && typeof record.text === "string") message = record.text;
   }
   return message;
+}
+
+function tokenUsageFrom(value: unknown): TokenUsage | undefined {
+  const usage = asRecord(value);
+  if (!usage) return undefined;
+  const inputTokens = numberAt(usage, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens") ?? 0;
+  const cachedInputTokens =
+    numberAt(usage, "cached_input_tokens", "cachedInputTokens", "cached_tokens", "cachedTokens") ?? 0;
+  const outputTokens =
+    numberAt(usage, "output_tokens", "outputTokens", "completion_tokens", "completionTokens") ?? 0;
+  if (inputTokens === 0 && cachedInputTokens === 0 && outputTokens === 0) return undefined;
+  return { inputTokens, cachedInputTokens, outputTokens };
+}
+
+function numberAt(record: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  }
+  return undefined;
 }
 
 export class LiveCodexConversationManager implements LiveCodexConversations {
@@ -315,9 +336,10 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
     if (!threadId || !turnId || !status) return;
     const key = `${threadId}:${turnId}`;
     const finalMessage = agentMessageFromItems(turn?.items) ?? this.finalMessages.get(key);
+    const usage = tokenUsageFrom(turn?.usage) ?? tokenUsageFrom(event.params.usage);
     if (this.completingTurns.has(key)) return;
     this.completingTurns.add(key);
-    void this.completeTurn(threadId, turnId, status, finalMessage).finally(() => {
+    void this.completeTurn(threadId, turnId, status, finalMessage, usage).finally(() => {
       this.completingTurns.delete(key);
       this.finalMessages.delete(key);
       this.discardFirstMessage(threadId, turnId);
@@ -329,6 +351,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
     turnId: string,
     status: string,
     finalMessage: string | undefined,
+    usage: TokenUsage | undefined,
   ): Promise<void> {
     for (const chatId of this.runningChats) {
       const conversation = this.db.getLiveConversation(chatId);
@@ -355,7 +378,14 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       const outbound = await prepareResultOutbox(result, chatId, jobId, this.config);
       const current = this.db.getLiveConversation(chatId);
       if (!current || current.active_job_id !== jobId) return;
-      this.db.completeJob(jobId, result.message, "codex", threadId, outbound);
+      this.db.completeJob(
+        jobId,
+        result.message,
+        "codex",
+        threadId,
+        outbound,
+        usage ? { usage } : undefined,
+      );
       if (!this.db.finishLiveConversation(chatId, jobId)) return;
       this.clearChat(chatId);
       this.logger.info("live_codex.turn_completed", {

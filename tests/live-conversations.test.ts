@@ -73,7 +73,7 @@ function agentMessage(text: string): CodexAppServerEvent {
   };
 }
 
-function completed(finalMessage: string): CodexAppServerEvent {
+function completed(finalMessage: string, usage?: Record<string, number>): CodexAppServerEvent {
   return {
     method: "turn/completed",
     params: {
@@ -82,6 +82,7 @@ function completed(finalMessage: string): CodexAppServerEvent {
         id: "turn-1",
         status: "completed",
         items: [{ type: "agentMessage", text: finalMessage }],
+        ...(usage ? { usage } : {}),
       },
     },
   };
@@ -113,10 +114,22 @@ describe("LiveCodexConversationManager", () => {
       { chatId, jobId, text: "I’ll inspect the workspace, then make the targeted change." },
     ]);
 
-    emit(manager, completed('{"message":"Implemented and verified the change.","attachments":[]}'));
+    emit(
+      manager,
+      completed('{"message":"Implemented and verified the change.","attachments":[]}', {
+        input_tokens: 100,
+        cached_input_tokens: 25,
+        output_tokens: 50,
+      }),
+    );
     await flush();
 
     expect(db.getJob(jobId)?.status).toBe("completed");
+    expect(db.getJob(jobId)).toMatchObject({
+      input_tokens: 100,
+      cached_input_tokens: 25,
+      output_tokens: 50,
+    });
     expect(notifyDelivery).toHaveBeenCalledOnce();
     const final = db.claimNextOutbox()!;
     expect(JSON.parse(final.payload_json)).toEqual({ text: "Implemented and verified the change." });

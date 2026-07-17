@@ -14,10 +14,54 @@ import {
   startReleaseWatchdog,
   writeRestartRequest,
 } from "./self-update.js";
+import type { CostSummary } from "./types.js";
 import type { TelegramClient, TelegramMessage, TelegramUpdate } from "./telegram.js";
 import type { JobWorker } from "./worker.js";
 
 const TELEGRAM_START_RETRY_MS = 3_000;
+
+function startOfLocalDaySql(days: number): string {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() - (days - 1));
+  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
+function formatMoney(costUsd: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  }).format(costUsd);
+}
+
+function formatTokens(tokens: number): string {
+  return new Intl.NumberFormat("en-US").format(tokens);
+}
+
+function formatCostLine(label: string, summary: CostSummary): string {
+  if (summary.jobs === 0) return `${label}: no tracked runs`;
+  const reported =
+    summary.pricedJobs === 0
+      ? "no provider-reported USD"
+      : `${formatMoney(summary.costUsd)} reported`;
+  const unpriced = summary.jobs - summary.pricedJobs;
+  return `${label}: ${reported} across ${summary.jobs} run${summary.jobs === 1 ? "" : "s"}${
+    unpriced ? `; ${unpriced} without a dollar figure` : ""
+  }`;
+}
+
+function formatCostReport(periods: Array<{ label: string; summary: CostSummary }>): string {
+  const selected = periods.at(-1)!;
+  const codex = selected.summary.providers.codex.usage;
+  return [
+    "Spend (finished AIMessenger runs; provider-reported USD)",
+    ...periods.map(({ label, summary }) => formatCostLine(label, summary)),
+    `Codex and gateway tokens (${selected.label}; no dollar amount is available): ${formatTokens(codex.inputTokens)} input, ${formatTokens(codex.cachedInputTokens)} cached input, ${formatTokens(codex.outputTokens)} output`,
+    "Use /cost <days> for a calendar window, or /cost all.",
+  ].join("\n");
+}
 
 export class TelegramAgentService {
   private active = false;
@@ -303,6 +347,38 @@ export class TelegramAgentService {
           this.logger.error("self_update.rollback_rejected", error);
           await this.telegram.sendText(message.chat.id, "No previous healthy release is available.");
         }
+        return;
+      }
+      case "cost": {
+        const today = startOfLocalDaySql(1);
+        if (command.window === "summary") {
+          await this.telegram.sendText(
+            message.chat.id,
+            formatCostReport([
+              { label: "Today", summary: this.db.costSummary(today) },
+              { label: "Last 7 days", summary: this.db.costSummary(startOfLocalDaySql(7)) },
+              { label: "All time", summary: this.db.costSummary() },
+            ]),
+          );
+          return;
+        }
+        if (command.window === "all") {
+          await this.telegram.sendText(
+            message.chat.id,
+            formatCostReport([{ label: "All time", summary: this.db.costSummary() }]),
+          );
+          return;
+        }
+        const days = command.days!;
+        await this.telegram.sendText(
+          message.chat.id,
+          formatCostReport([
+            {
+              label: days === 1 ? "Today" : `Last ${days} days`,
+              summary: this.db.costSummary(startOfLocalDaySql(days)),
+            },
+          ]),
+        );
         return;
       }
       case "stop": {

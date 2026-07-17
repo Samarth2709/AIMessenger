@@ -41,11 +41,14 @@ describe("provider adapters", () => {
     const argsFile = path.join(os.tmpdir(), `aimessenger-codex-args-${process.pid}.txt`);
     const command = executable(
       `printf '%s\\n' "$@" > "${argsFile}"\n` +
-        `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-123"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"codex ok\\",\\"attachments\\":[]}"}}'`,
+        `printf '%s\\n' '{"type":"thread.started","thread_id":"thread-123"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"codex ok\\",\\"attachments\\":[]}"}}' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":25,"output_tokens":50}}'`,
     );
     const output = await new CodexProvider(command).run(baseInput);
     expect(output.sessionId).toBe("thread-123");
     expect(output.result).toEqual({ message: "codex ok", attachments: [] });
+    expect(output.metrics).toEqual({
+      usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+    });
     expect(fs.readFileSync(argsFile, "utf8")).toContain("--ignore-user-config");
     expect(fs.readFileSync(argsFile, "utf8")).toContain("--model");
     expect(fs.readFileSync(argsFile, "utf8")).toContain("test-model");
@@ -55,11 +58,12 @@ describe("provider adapters", () => {
 
   it("captures Claude structured_output and session ID", async () => {
     const command = executable(
-      `printf '%s\\n' '{"type":"result","session_id":"claude-123","is_error":false,"structured_output":{"message":"claude ok","attachments":[]}}'`,
+      `printf '%s\\n' '{"type":"result","session_id":"claude-123","is_error":false,"total_cost_usd":0.0125,"structured_output":{"message":"claude ok","attachments":[]}}'`,
     );
     const output = await new ClaudeProvider(command).run(baseInput);
     expect(output.sessionId).toBe("claude-123");
     expect(output.result).toEqual({ message: "claude ok", attachments: [] });
+    expect(output.metrics).toEqual({ costUsd: 0.0125, usage: undefined });
   });
 
   it("keeps a malformed Codex structured result empty for retry handling", async () => {
@@ -72,12 +76,20 @@ describe("provider adapters", () => {
 
   it("calls the AI Security gateway with the selected model", async () => {
     const request = vi.fn(async () =>
-      new Response(JSON.stringify({ choices: [{ message: { content: "gateway ok" } }] })),
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "gateway ok" } }],
+          usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 25 }, completion_tokens: 50 },
+        }),
+      ),
     );
     const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
 
     expect(output.result).toEqual({ message: "gateway ok", attachments: [] });
     expect(output.sessionId).toBe("__aimessenger_stateless__");
+    expect(output.metrics).toEqual({
+      usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 50 },
+    });
     expect(request).toHaveBeenCalledWith(
       "http://gateway.test/v1/chat/completions",
       expect.objectContaining({

@@ -1,4 +1,10 @@
-import type { AgentProvider, ProviderRunInput, ProviderRunOutput } from "./types.js";
+import type { TokenUsage } from "../types.js";
+import {
+  ProviderRunError,
+  type AgentProvider,
+  type ProviderRunInput,
+  type ProviderRunOutput,
+} from "./types.js";
 import { buildPrompt, parseAgentResult } from "./structured.js";
 import { ProcessError, runProcess } from "./process.js";
 
@@ -64,6 +70,7 @@ export class CodexProvider implements AgentProvider {
     let sessionId = streamedSessionId;
     let finalText = "";
     let errorMessage = "";
+    let usage: TokenUsage | undefined;
     for (const line of processResult.stdout.split("\n")) {
       if (!line.trim()) continue;
       try {
@@ -75,16 +82,34 @@ export class CodexProvider implements AgentProvider {
           const item = event.item as Record<string, unknown>;
           if (item.type === "agent_message" && typeof item.text === "string") finalText = item.text;
         }
+        if (event.type === "turn.completed") usage = asTokenUsage(event.usage);
         if (event.type === "error" && typeof event.message === "string") errorMessage = event.message;
       } catch {
         // Codex emits JSONL; ignore non-event diagnostic lines.
       }
     }
-    if (!finalText && errorMessage) throw new Error(`Codex failed: ${errorMessage}`);
+    if (!finalText && errorMessage) {
+      throw new ProviderRunError(`Codex failed: ${errorMessage}`, usage ? { usage } : undefined);
+    }
     return {
       result: parseAgentResult(finalText),
       sessionId,
       rawOutput: processResult.stdout,
+      metrics: usage ? { usage } : undefined,
     };
   }
+}
+
+function asTokenUsage(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const inputTokens = asNonNegativeNumber(record.input_tokens) ?? 0;
+  const cachedInputTokens = asNonNegativeNumber(record.cached_input_tokens) ?? 0;
+  const outputTokens = asNonNegativeNumber(record.output_tokens) ?? 0;
+  if (inputTokens === 0 && cachedInputTokens === 0 && outputTokens === 0) return undefined;
+  return { inputTokens, cachedInputTokens, outputTokens };
+}
+
+function asNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }

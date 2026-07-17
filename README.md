@@ -63,6 +63,7 @@ npm run health
 - `/status` shows the active provider, model, live Codex turn, queue, and latest retryable job ID.
 - `/updates` shows the active release and the latest self-update outcome.
 - `/rollback` restores the prior healthy release and restarts after active work drains.
+- `/cost` shows today, the last seven calendar days, and all-time provider-reported spend; use `/cost <days>` or `/cost all` for one period. Claude reports a dollar total when available. Codex reports token counts but does not expose a dollar amount through its CLI, so AIMessenger does not guess one.
 - `/stop` terminates the current process group and taints that provider session.
 - `/new codex|claude|all` starts clean native sessions.
 - `/retry <job-id>` retries a failed, canceled, or interrupted job.
@@ -181,6 +182,8 @@ ssh home-pi 'curl --fail --silent http://127.0.0.1:8791/healthz'
    ```
 
 The Columbia Google Workspace administrator may block third-party OAuth. If the second authorization is denied, the app remains able to create drafts only for the personal Gmail account until the Columbia policy allows the client.
+
+Cost tracking begins after upgrading to this version; the existing job database has no historic provider cost records to backfill.
 
 ## Files and recovery
 
