@@ -282,11 +282,14 @@ export class MemoryService {
       .readFileSync(auditPath, "utf8")
       .split("\n")
       .filter((line) => /`memory_(?:create|edit|supersede)`/.test(line));
-    return refs.every(
-      (ref) =>
-        this.isAllowedPath(ref) &&
-        changes.some((line) => line.includes(`changed: \`${ref}\``)),
-    );
+    return refs.every((ref) => {
+      try {
+        const relativePath = this.canonicalRelativePath(ref);
+        return changes.some((line) => line.includes(`changed: \`${relativePath}\``));
+      } catch {
+        return false;
+      }
+    });
   }
 
   private search(input: SearchInput): { results: Array<Record<string, unknown>> } {
@@ -362,41 +365,45 @@ export class MemoryService {
   }
 
   private create(input: WriteInput): Record<string, unknown> {
-    const target = this.resolvePath(input.path);
-    if (fs.existsSync(target)) throw new Error(`Memory document already exists: ${input.path}`);
-    this.assertWritablePath(input.path);
+    const relativePath = this.canonicalRelativePath(input.path);
+    const target = this.resolvePath(relativePath);
+    if (fs.existsSync(target)) throw new Error(`Memory document already exists: ${relativePath}`);
+    this.assertWritablePath(relativePath);
     const source = this.withUpdatedTimestamp(input.document);
-    this.validateDocument(input.path, source);
+    this.validateDocument(relativePath, source);
     this.writeAtomic(target, source);
     this.refreshIndex();
-    return { path: input.path, revision: revision(source) };
+    return { path: relativePath, revision: revision(source) };
   }
 
   private edit(input: WriteInput): Record<string, unknown> {
-    const existing = this.loadDocument(input.path);
-    this.assertWritablePath(input.path);
+    const relativePath = this.canonicalRelativePath(input.path);
+    const existing = this.loadDocument(relativePath);
+    this.assertWritablePath(relativePath);
     if (!input.expected_revision) throw new Error("memory_edit requires expected_revision from memory_read.");
     if (input.expected_revision !== existing.revision) throw new Error("Memory document changed; read it again before editing.");
     const source = this.withUpdatedTimestamp(input.document);
-    this.validateDocument(input.path, source);
-    this.writeAtomic(this.resolvePath(input.path), source);
+    this.validateDocument(relativePath, source);
+    this.writeAtomic(this.resolvePath(relativePath), source);
     this.refreshIndex();
-    return { path: input.path, revision: revision(source) };
+    return { path: relativePath, revision: revision(source) };
   }
 
   private supersede(input: SupersedeInput): Record<string, unknown> {
-    const existing = this.loadDocument(input.path);
-    this.loadDocument(input.replacement_path);
+    const relativePath = this.canonicalRelativePath(input.path);
+    const replacementPath = this.canonicalRelativePath(input.replacement_path);
+    const existing = this.loadDocument(relativePath);
+    this.loadDocument(replacementPath);
     if (!input.expected_revision) throw new Error("memory_supersede requires expected_revision from memory_read.");
     if (existing.revision !== input.expected_revision) throw new Error("Memory document changed; read it again before superseding.");
     const updated = existing.source
       .replace(/^status:\s*.*$/m, "status: superseded")
       .replace(/^updated:\s*.*$/m, `updated: ${now()}`)
-      .trimEnd() + `\n\n## Superseded\n\nReplaced by [${input.replacement_path}](../${input.replacement_path}) on ${now()}: ${input.reason.trim()}\n`;
-    this.validateDocument(input.path, updated);
-    this.writeAtomic(this.resolvePath(input.path), updated);
+      .trimEnd() + `\n\n## Superseded\n\nReplaced by [${replacementPath}](../${replacementPath}) on ${now()}: ${input.reason.trim()}\n`;
+    this.validateDocument(relativePath, updated);
+    this.writeAtomic(this.resolvePath(relativePath), updated);
     this.refreshIndex();
-    return { path: input.path, revision: revision(updated), superseded_by: input.replacement_path };
+    return { path: relativePath, revision: revision(updated), superseded_by: replacementPath };
   }
 
   private allDocuments(): MemoryDocument[] {
@@ -423,11 +430,12 @@ export class MemoryService {
   }
 
   private loadDocument(relativePath: string): MemoryDocument {
-    const target = this.resolvePath(relativePath);
-    if (!fs.existsSync(target)) throw new Error(`Memory document not found: ${relativePath}`);
+    const canonicalPath = this.canonicalRelativePath(relativePath);
+    const target = this.resolvePath(canonicalPath);
+    if (!fs.existsSync(target)) throw new Error(`Memory document not found: ${canonicalPath}`);
     const source = fs.readFileSync(target, "utf8");
     const frontmatter = parseFrontmatter(source);
-    return { path: relativePath, source, frontmatter, title: heading(source), revision: revision(source) };
+    return { path: canonicalPath, source, frontmatter, title: heading(source), revision: revision(source) };
   }
 
   private refreshIndex(): void {
@@ -487,17 +495,21 @@ export class MemoryService {
   }
 
   private resolvePath(relativePath: string): string {
-    if (!this.isAllowedPath(relativePath)) throw new Error("Memory path is outside the permitted Markdown hierarchy.");
-    const resolved = path.resolve(this.memoryDir, relativePath);
+    const canonicalPath = this.canonicalRelativePath(relativePath);
+    const resolved = path.resolve(this.memoryDir, canonicalPath);
     if (!resolved.startsWith(`${this.memoryDir}${path.sep}`) && resolved !== this.memoryDir) {
       throw new Error("Memory path escapes the vault.");
     }
     return resolved;
   }
 
-  private isAllowedPath(relativePath: string): boolean {
-    if (relativePath === "INDEX.md") return true;
-    return /^(?:core\/(?:profile|preferences|decisions)\.md|projects\/[a-z0-9][a-z0-9-]*\/(?:index|state)\.md|projects\/[a-z0-9][a-z0-9-]*\/tasks\/[a-z0-9][a-z0-9._-]*\.md|topics\/[a-z0-9][a-z0-9._-]*\.md|archive\/\d{4}\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\.md|audit\/\d+\.md)$/.test(relativePath);
+  private canonicalRelativePath(relativePath: string): string {
+    const normalized = relativePath.replace(/^(?:\.\/)*(?:memory\/)?/, "");
+    if (normalized === "INDEX.md") return normalized;
+    if (/^(?:core\/(?:profile|preferences|decisions)\.md|projects\/[a-z0-9][a-z0-9-]*\/(?:index|state)\.md|projects\/[a-z0-9][a-z0-9-]*\/tasks\/[a-z0-9][a-z0-9._-]*\.md|topics\/[a-z0-9][a-z0-9._-]*\.md|archive\/\d{4}\/[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*\.md|audit\/\d+\.md)$/.test(normalized)) {
+      return normalized;
+    }
+    throw new Error("Memory path is outside the permitted Markdown hierarchy.");
   }
 
   private assertWritablePath(relativePath: string): void {

@@ -91,6 +91,26 @@ describe("Markdown memory vault", () => {
     ).toThrow("changed");
   });
 
+  it("accepts a safe memory-directory alias while preserving canonical paths and escape checks", () => {
+    const { memory } = fixture();
+    memory.contextForJob(46);
+    const created = memory.executeTool(
+      "memory_create",
+      { path: "memory/topics/self-improving-ai.md", document: document("Self-improving AI") },
+      46,
+    ) as { path: string; revision: string };
+    expect(created.path).toBe("topics/self-improving-ai.md");
+    const read = memory.executeTool(
+      "memory_read",
+      { path: "./memory/topics/self-improving-ai.md" },
+      46,
+    ) as { path: string; revision: string };
+    expect(read).toMatchObject({ path: created.path, revision: created.revision });
+    expect(() =>
+      memory.executeTool("memory_create", { path: "memory/../escape.md", document: document("Escape") }, 46),
+    ).toThrow("permitted Markdown hierarchy");
+  });
+
   it("supersedes memory and exposes exact history only on demand", () => {
     const { db, memory } = fixture();
     memory.contextForJob(43);
