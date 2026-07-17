@@ -86,8 +86,10 @@ function main(): void {
     const source = paths.source;
     if (!fs.existsSync(path.join(source, ".git"))) throw new Error("Managed source checkout is missing .git.");
 
-    run("git", ["diff", "--check"], source);
-    run("git", ["diff", "--cached", "--check"], source);
+    // A self-update may run through SSH with a pseudo-terminal. Explicitly
+    // bypass Git's pager so these validation checks cannot wait for pager input.
+    run("git", ["--no-pager", "diff", "--check"], source);
+    run("git", ["--no-pager", "diff", "--cached", "--check"], source);
     run("npm", ["test"], source);
     run("npm", ["run", "build"], source);
 
