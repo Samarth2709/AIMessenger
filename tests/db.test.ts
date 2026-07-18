@@ -59,6 +59,56 @@ describe("AppDatabase", () => {
     db.close();
   });
 
+  it("migrates legacy user transcript rows into their originating chat", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-db-transcript-migration-"));
+    tempDirs.push(dir);
+    const databasePath = path.join(dir, "test.sqlite");
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE transcript (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        provider TEXT,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        update_id INTEGER NOT NULL,
+        telegram_message_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        user_message_id INTEGER NOT NULL,
+        provider TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL,
+        retry_of INTEGER,
+        started_at TEXT,
+        finished_at TEXT,
+        error TEXT,
+        result_text TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      INSERT INTO transcript(id, role, provider, content) VALUES (7, 'user', NULL, 'legacy context');
+      INSERT INTO transcript(id, role, provider, content) VALUES (8, 'assistant', 'codex', 'legacy answer');
+      INSERT INTO jobs(update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, status)
+      VALUES (1, 2, 55, 7, 'codex', 'legacy context', 'completed');
+    `);
+    legacy.close();
+
+    const db = new AppDatabase(databasePath);
+    const transcriptColumns = db.db.prepare("PRAGMA table_info(transcript)").all() as Array<{ name: string }>;
+    expect(transcriptColumns.map((column) => column.name)).toContain("chat_id");
+    expect(db.searchHistory("legacy context", 55)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 7 })]),
+    );
+    expect(db.searchHistory("legacy context", 56)).toEqual([]);
+    expect(db.searchHistory("legacy answer", 55)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 8, role: "assistant" })]),
+    );
+    db.close();
+  });
+
   it("deduplicates Telegram updates and queues one job", () => {
     const db = createDb();
     expect(db.recordUpdate(10, 20, 30, 40, "hello")).toBe(true);
@@ -114,9 +164,9 @@ describe("AppDatabase", () => {
       attachments: [],
     });
     expect(db.getJob(secondId)?.prompt).toBe("second");
-    const match = db.searchHistory("codex answer");
+    const match = db.searchHistory("codex answer", 32);
     expect(match).toHaveLength(1);
-    expect(db.readHistory([match[0]!.id])[0]?.content).toBe("codex answer");
+    expect(db.readHistory([match[0]!.id], 32)[0]?.content).toBe("codex answer");
     db.close();
   });
 
@@ -272,7 +322,7 @@ describe("AppDatabase", () => {
       attachments: [],
     });
     expect(db.getProviderSession("claude")).toMatchObject({ session_id: null, tainted: 0 });
-    expect(db.searchHistory("old answer")).toHaveLength(1);
+    expect(db.searchHistory("old answer", 311)).toHaveLength(1);
     db.close();
   });
 
@@ -298,8 +348,8 @@ describe("AppDatabase", () => {
       attachments: [],
     });
 
-    const match = db.searchHistory("first gateway answer");
-    expect(db.readHistory([match[0]!.id])[0]?.content).toBe("first gateway answer");
+    const match = db.searchHistory("first gateway answer", 311);
+    expect(db.readHistory([match[0]!.id], 311)[0]?.content).toBe("first gateway answer");
     db.close();
   });
 

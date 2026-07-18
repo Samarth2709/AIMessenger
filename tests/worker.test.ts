@@ -58,7 +58,7 @@ describe("JobWorker", () => {
     const telegram = new TelegramClient("test-token-that-is-long-enough", "https://example.test", fakeFetch);
     const provider: AgentProvider = {
       run: vi.fn(async () => ({
-        result: { message: "finished", attachments: [] },
+        result: { message: "finished", attachments: [], sessionDisposition: "continue" as const, memoryRefs: [] },
         sessionId: "session-1",
         rawOutput: "",
         metrics: {

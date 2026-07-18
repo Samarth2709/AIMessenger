@@ -70,6 +70,12 @@ interface WriteInput {
   expected_revision?: string;
 }
 
+interface HistorySearchInput {
+  query?: string;
+  recent: boolean;
+  limit: number;
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -247,20 +253,41 @@ export class MemoryService {
       case "memory_supersede":
         throw new Error("User memory changes must edit the current profile or preferences document; superseding documents is not supported.");
       case "history_search": {
-        const record = this.objectInput(input);
-        const query = this.stringInput(record.query, "query");
-        const limit = this.boundedNumber(record.limit, 5, 1, 10);
-        result = { results: this.db.searchHistory(query, limit) };
+        const history = this.historySearchInput(input);
+        const job = this.db.getJob(jobId);
+        if (!job) throw new Error(`Cannot search history for missing job ${jobId}.`);
+        result = {
+          results: history.recent
+            ? this.db.recentHistory(job.chat_id, history.limit, job.user_message_id)
+            : this.db.searchHistory(history.query!, job.chat_id, history.limit, job.user_message_id),
+        };
         break;
       }
       case "history_read": {
         const record = this.objectInput(input);
-        if (!Array.isArray(record.ids) || !record.ids.every((id) => Number.isSafeInteger(id) && id > 0)) {
-          throw new Error("history_read requires positive integer ids.");
+        if (
+          !Array.isArray(record.ids) ||
+          record.ids.length < 1 ||
+          record.ids.length > 10 ||
+          !record.ids.every((id) => Number.isSafeInteger(id) && id > 0) ||
+          new Set(record.ids).size !== record.ids.length
+        ) {
+          throw new Error("history_read requires 1 to 10 unique positive integer ids.");
         }
-        result = {
-          entries: this.db.readHistory(record.ids as number[], this.boundedNumber(record.max_chars, 8_000, 500, 12_000)),
-        };
+        const job = this.db.getJob(jobId);
+        if (!job) throw new Error(`Cannot read history for missing job ${jobId}.`);
+        if ((record.ids as number[]).some((id) => id >= job.user_message_id)) {
+          throw new Error("history_read can access only transcript entries before the current user message.");
+        }
+        const entries = this.db.readHistory(
+          record.ids as number[],
+          job.chat_id,
+          this.boundedNumber(record.max_chars, 8_000, 500, 12_000),
+        );
+        if (entries.length !== record.ids.length) {
+          throw new Error("history_read can access only transcript entries from the current chat.");
+        }
+        result = { entries };
         break;
       }
       default:
@@ -720,6 +747,20 @@ export class MemoryService {
     };
   }
 
+  private historySearchInput(input: unknown): HistorySearchInput {
+    const record = this.objectInput(input);
+    const query = typeof record.query === "string" ? record.query.trim() : undefined;
+    const recent = record.recent === true;
+    if (recent === Boolean(query)) {
+      throw new Error("history_search requires exactly one of a non-empty query or recent: true.");
+    }
+    return {
+      ...(query ? { query } : {}),
+      recent,
+      limit: this.boundedNumber(record.limit, 5, 1, 10),
+    };
+  }
+
 }
 
 export function memoryToolDefinitions(): GatewayToolDefinition[] {
@@ -759,8 +800,8 @@ export function memoryToolDefinitions(): GatewayToolDefinition[] {
       type: "function",
       function: {
         name: "history_search",
-        description: "Search exact raw prior chat messages in the private SQLite archive. Use only when Markdown memory is insufficient.",
-        parameters: { type: "object", additionalProperties: false, properties: { query: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 10 } }, required: ["query"] },
+        description: "Find exact raw prior chat messages in the private SQLite archive. For an ambiguous follow-up, call with recent: true to get only turns before the current user message; otherwise search with a query. Read returned IDs before relying on them.",
+        parameters: { type: "object", additionalProperties: false, minProperties: 1, properties: { query: { type: "string" }, recent: { type: "boolean", description: "Return the bounded most-recent turns before the current user message. Use this for referential follow-ups." }, limit: { type: "integer", minimum: 1, maximum: 10 } } },
       },
     },
     {
@@ -768,7 +809,7 @@ export function memoryToolDefinitions(): GatewayToolDefinition[] {
       function: {
         name: "history_read",
         description: "Read bounded exact raw transcript entries returned by history_search.",
-        parameters: { type: "object", additionalProperties: false, properties: { ids: { type: "array", items: { type: "integer", minimum: 1 }, minItems: 1, maxItems: 10 }, max_chars: { type: "integer", minimum: 500, maximum: 12000 } }, required: ["ids"] },
+        parameters: { type: "object", additionalProperties: false, properties: { ids: { type: "array", items: { type: "integer", minimum: 1 }, minItems: 1, maxItems: 10, uniqueItems: true }, max_chars: { type: "integer", minimum: 500, maximum: 12000 } }, required: ["ids"] },
       },
     },
   ];

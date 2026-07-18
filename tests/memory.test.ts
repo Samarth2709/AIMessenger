@@ -22,13 +22,13 @@ function fixture(): { db: AppDatabase; memory: MemoryService; dir: string } {
   return { db, memory, dir };
 }
 
-function enqueueUserJob(db: AppDatabase, prompt: string): number {
+function enqueueUserJob(db: AppDatabase, prompt: string, chatId = 20_000): number {
   const updateId = nextUpdateId++;
-  db.recordUpdate(updateId, updateId + 10_000, updateId + 20_000, updateId + 30_000, prompt);
+  db.recordUpdate(updateId, updateId + 10_000, chatId, updateId + 30_000, prompt);
   return db.enqueueJob({
     updateId,
     telegramMessageId: updateId + 10_000,
-    chatId: updateId + 20_000,
+    chatId,
     provider: "codex",
     prompt,
     attachments: [],
@@ -479,14 +479,66 @@ Conversation task state must not become semantic user memory.
 
     const historyJob = enqueueUserJob(db, "Remember this exact gateway detail.");
     db.completeJob(historyJob, "Gateway answer", "codex", "thread");
-    const history = memory.executeTool("history_search", { query: "exact gateway" }, jobId) as {
+    const lookupJob = enqueueUserJob(db, "What was the gateway detail?");
+    const history = memory.executeTool("history_search", { query: "exact gateway" }, lookupJob) as {
       results: Array<{ id: number; role: string }>;
     };
     expect(history.results[0]).toMatchObject({ role: "user" });
-    const entries = memory.executeTool("history_read", { ids: [history.results[0]!.id] }, jobId) as {
+    const entries = memory.executeTool("history_read", { ids: [history.results[0]!.id] }, lookupJob) as {
       entries: Array<{ content: string }>;
     };
     expect(entries.entries[0]?.content).toContain("gateway");
+  });
+
+  it("keeps the current ambiguous prompt out of history and exposes bounded prior turns", () => {
+    const { db, memory } = fixture();
+    const macbookJob = enqueueUserJob(
+      db,
+      "Find a MacBook Pro with at least 24 GB of RAM and 512 GB of storage.",
+      77,
+    );
+    db.completeJob(macbookJob, "I will look for matching MacBook Pros.", "codex", "thread");
+    const otherChatJob = enqueueUserJob(db, "Find a MacBook Pro with at least 24 GB of RAM.", 88);
+    db.completeJob(otherChatJob, "Other chat MacBook answer.", "codex", "thread");
+    const followupJob = enqueueUserJob(db, "What about eBay under $1,000?", 77);
+    const currentMessageId = db.getJob(followupJob)!.user_message_id;
+
+    const searched = memory.executeTool("history_search", { query: "MacBook Pro" }, followupJob) as {
+      results: Array<{ id: number }>;
+    };
+    expect(searched.results).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: db.getJob(macbookJob)!.user_message_id })]),
+    );
+    expect(searched.results).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: currentMessageId })]));
+    expect(searched.results).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: db.getJob(otherChatJob)!.user_message_id })]),
+    );
+
+    const recent = memory.executeTool("history_search", { recent: true, limit: 2 }, followupJob) as {
+      results: Array<{ id: number; role: string; snippet: string }>;
+    };
+    expect(recent.results).toHaveLength(2);
+    expect(recent.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: db.getJob(macbookJob)!.user_message_id,
+          role: "user",
+          snippet: expect.stringContaining("MacBook Pro"),
+        }),
+      ]),
+    );
+    expect(recent.results).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: currentMessageId })]));
+
+    expect(() => memory.executeTool("history_search", {}, followupJob)).toThrow("exactly one");
+    expect(() => memory.executeTool("history_search", { query: "MacBook", recent: true }, followupJob)).toThrow("exactly one");
+    expect(() => memory.executeTool("history_read", { ids: [currentMessageId] }, followupJob)).toThrow(
+      "before the current user message",
+    );
+    expect(() => memory.executeTool("history_read", { ids: [db.getJob(otherChatJob)!.user_message_id] }, followupJob)).toThrow(
+      "current chat",
+    );
+    expect(() => memory.executeTool("history_read", { ids: [1, 1] }, followupJob)).toThrow("unique");
+    expect(() => memory.executeTool("history_read", { ids: Array.from({ length: 11 }, (_, index) => index + 1) }, followupJob)).toThrow("1 to 10");
   });
 
   it("accepts handoff references only for profile or preferences changed by that job", () => {

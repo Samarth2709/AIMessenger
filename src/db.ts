@@ -52,6 +52,7 @@ export class AppDatabase {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
         provider TEXT,
+        chat_id INTEGER NOT NULL,
         content TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -165,6 +166,23 @@ export class AppDatabase {
     for (const [name, type] of additions) {
       if (!jobColumns.some((column) => column.name === name)) {
         this.db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${type}`);
+      }
+    }
+    const transcriptColumns = this.db.prepare("PRAGMA table_info(transcript)").all() as Array<{ name: string }>;
+    if (!transcriptColumns.some((column) => column.name === "chat_id")) {
+      this.db.exec("ALTER TABLE transcript ADD COLUMN chat_id INTEGER");
+      this.db.exec(`
+        UPDATE transcript
+        SET chat_id = (
+          SELECT jobs.chat_id FROM jobs WHERE jobs.user_message_id = transcript.id
+        )
+        WHERE role = 'user' AND chat_id IS NULL
+      `);
+      const chatIds = this.db
+        .prepare("SELECT DISTINCT chat_id FROM jobs ORDER BY chat_id")
+        .all() as Array<{ chat_id: number }>;
+      if (chatIds.length === 1) {
+        this.db.prepare("UPDATE transcript SET chat_id = ? WHERE chat_id IS NULL").run(chatIds[0]!.chat_id);
       }
     }
     const hasTranscriptFts = Boolean(
@@ -295,8 +313,8 @@ export class AppDatabase {
   }): number {
     return this.db.transaction(() => {
       const message = this.db
-        .prepare("INSERT INTO transcript(role, provider, content) VALUES ('user', NULL, ?)")
-        .run(input.prompt);
+        .prepare("INSERT INTO transcript(role, provider, chat_id, content) VALUES ('user', NULL, ?, ?)")
+        .run(input.chatId, input.prompt);
       const job = this.db
         .prepare(
           `INSERT INTO jobs
@@ -339,8 +357,8 @@ export class AppDatabase {
         return { fresh: false, jobId: this.getJobByUpdate(input.updateId)?.id };
       }
       const message = this.db
-        .prepare("INSERT INTO transcript(role, provider, content) VALUES ('user', NULL, ?)")
-        .run(input.prompt);
+        .prepare("INSERT INTO transcript(role, provider, chat_id, content) VALUES ('user', NULL, ?, ?)")
+        .run(input.chatId, input.prompt);
       const job = this.db
         .prepare(
           `INSERT INTO jobs
@@ -380,8 +398,8 @@ export class AppDatabase {
       if (inserted.changes === 0) return { fresh: false, action: "steer" as const };
 
       const message = this.db
-        .prepare("INSERT INTO transcript(role, provider, content) VALUES ('user', NULL, ?)")
-        .run(input.prompt);
+        .prepare("INSERT INTO transcript(role, provider, chat_id, content) VALUES ('user', NULL, ?, ?)")
+        .run(input.chatId, input.prompt);
       const transcriptId = Number(message.lastInsertRowid);
       const conversation = this.getLiveConversation(input.chatId);
       if (conversation && conversation.state !== "idle") {
@@ -699,9 +717,11 @@ export class AppDatabase {
     metrics?: JobMetrics,
   ): number {
     return this.db.transaction(() => {
+      const job = this.getJob(id);
+      if (!job) throw new Error(`Cannot complete missing job ${id}.`);
       const assistant = this.db
-        .prepare("INSERT INTO transcript(role, provider, content) VALUES ('assistant', ?, ?)")
-        .run(provider, resultText);
+        .prepare("INSERT INTO transcript(role, provider, chat_id, content) VALUES ('assistant', ?, ?, ?)")
+        .run(provider, job.chat_id, resultText);
       const messageId = Number(assistant.lastInsertRowid);
       this.db
         .prepare(
@@ -859,7 +879,7 @@ export class AppDatabase {
       .get(provider) as ProviderSessionRow;
   }
 
-  searchHistory(query: string, limit = 5): Array<{
+  searchHistory(query: string, chatId: number, limit = 5, beforeTranscriptId?: number): Array<{
     id: number;
     role: string;
     provider: string | null;
@@ -876,10 +896,12 @@ export class AppDatabase {
          FROM transcript_fts
          JOIN transcript ON transcript.id = transcript_fts.rowid
          WHERE transcript_fts MATCH ?
+         ${beforeTranscriptId ? "AND transcript.id < ?" : ""}
+         AND transcript.chat_id = ?
          ORDER BY bm25(transcript_fts), transcript.id DESC
          LIMIT ?`,
       )
-      .all(ftsQuery, limit) as Array<{
+      .all(ftsQuery, ...(beforeTranscriptId ? [beforeTranscriptId] : []), chatId, limit) as Array<{
       id: number;
       role: string;
       provider: string | null;
@@ -888,7 +910,34 @@ export class AppDatabase {
     }>;
   }
 
-  readHistory(ids: number[], maxChars = 8_000): Array<{
+  recentHistory(chatId: number, limit = 5, beforeTranscriptId?: number): Array<{
+    id: number;
+    role: string;
+    provider: string | null;
+    created_at: string;
+    snippet: string;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT id, role, provider, created_at,
+                substr(replace(replace(content, char(10), ' '), char(13), ' '), 1, 480) AS snippet
+         FROM transcript
+         WHERE 1 = 1
+         ${beforeTranscriptId ? "AND id < ?" : ""}
+         AND chat_id = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      )
+      .all(...(beforeTranscriptId ? [beforeTranscriptId] : []), chatId, limit) as Array<{
+      id: number;
+      role: string;
+      provider: string | null;
+      created_at: string;
+      snippet: string;
+    }>;
+  }
+
+  readHistory(ids: number[], chatId: number, maxChars = 8_000): Array<{
     id: number;
     role: string;
     provider: string | null;
@@ -901,9 +950,9 @@ export class AppDatabase {
     const rows = this.db
       .prepare(
         `SELECT id, role, provider, created_at, content
-         FROM transcript WHERE id IN (${placeholders})`,
+         FROM transcript WHERE id IN (${placeholders}) AND chat_id = ?`,
       )
-      .all(...ids) as Array<{
+      .all(...ids, chatId) as Array<{
       id: number;
       role: string;
       provider: string | null;

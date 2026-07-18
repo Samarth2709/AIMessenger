@@ -87,6 +87,8 @@ describe("parseAgentResult", () => {
     expect(prompt).toContain("never skill or host file paths");
     expect(prompt).toContain("inbound_update:42");
     expect(prompt).toContain("Never write task requests");
+    expect(prompt).toContain('history_search with {"recent":true}');
+    expect(prompt).toContain("History search always excludes the current inbound message");
     expect(prompt).not.toContain("conversation_context");
   });
 });
