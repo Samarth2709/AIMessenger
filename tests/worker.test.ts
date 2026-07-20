@@ -132,6 +132,74 @@ describe("JobWorker", () => {
     db.close();
   });
 
+  it("clears an incompatible gateway model after a classified Codex fallback", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-worker-fallback-"));
+    tempDirs.push(dir);
+    const db = new AppDatabase(path.join(dir, "test.sqlite"));
+    db.recordUpdate(21, 22, 23, 24, "answer this");
+    const jobId = db.enqueueJob({
+      updateId: 21,
+      telegramMessageId: 22,
+      chatId: 23,
+      provider: "codex",
+      prompt: "answer this",
+      attachments: [],
+    });
+    db.setSelectedModel("codex", "glm-5.2");
+    const fetchMock = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/sendChatAction")) return json(true);
+      if (url.endsWith("/sendMessage")) return json({ message_id: 400, chat: { id: 23, type: "private" } });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const fakeFetch = fetchMock as unknown as typeof fetch;
+    const provider: AgentProvider = {
+      run: vi.fn(async () => ({
+        result: { message: "continued with Codex", attachments: [] },
+        sessionId: "fresh-codex-session",
+        rawOutput: "",
+        routing: {
+          requestedModel: "glm-5.2",
+          fallbackReason: "Gateway exceeded the memory tool-call round limit.",
+        },
+      })),
+    };
+    const logger = createLogger();
+    const worker = new JobWorker(
+      db,
+      new TelegramClient("test-token-that-is-long-enough", "https://example.test", fakeFetch),
+      { codex: provider, claude: provider },
+      {
+        AIMESSENGER_DATA_DIR: dir,
+        AIMESSENGER_WORKING_DIR: dir,
+        JOB_TIMEOUT_MINUTES: 1,
+        CODEX_MODEL: "gpt-5.6-terra",
+        GATEWAY_MODELS: "glm-5.2",
+        jobsDir: path.join(dir, "jobs"),
+        appRoot: path.resolve("."),
+        identityPath: path.resolve("IDENTITY.md"),
+        skillsDir: path.join(dir, "skills"),
+      } as Config,
+      logger,
+    );
+    worker.start();
+
+    await vi.waitFor(() => expect(db.getJob(jobId)?.status).toBe("completed"));
+
+    expect(db.getSelectedModel("codex")).toBeUndefined();
+    expect(db.getJob(jobId)).toMatchObject({
+      requested_model: "glm-5.2",
+      fallback_reason: "Gateway exceeded the memory tool-call round limit.",
+    });
+    expect(logger.warn).toHaveBeenCalledWith(
+      "gateway.capability_fallback",
+      expect.objectContaining({ job_id: jobId, requested_model: "glm-5.2" }),
+    );
+    expect(fetchMock.mock.calls.some(([, init]) => String((init as RequestInit).body).includes("cleared that selection"))).toBe(true);
+    await worker.shutdown();
+    db.close();
+  });
+
   it("kills a persisted orphan process group before marking its job interrupted", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-orphan-"));
     tempDirs.push(dir);
@@ -148,9 +216,15 @@ describe("JobWorker", () => {
     db.claimNextJob();
 
     const sleeper = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+    const childSleeper = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
     const pid = sleeper.pid!;
+    const childPid = childSleeper.pid!;
     db.setJobProcessPid(jobId, pid);
-    const exited = new Promise<void>((resolve) => sleeper.once("close", () => resolve()));
+    db.addJobProcess(jobId, childPid, "deep-research-track");
+    const exited = Promise.all([
+      new Promise<void>((resolve) => sleeper.once("close", () => resolve())),
+      new Promise<void>((resolve) => childSleeper.once("close", () => resolve())),
+    ]);
 
     const telegram = {} as TelegramClient;
     const provider: AgentProvider = {
@@ -180,6 +254,8 @@ describe("JobWorker", () => {
     await exited;
     expect(db.getJob(jobId)?.status).toBe("interrupted");
     expect(() => process.kill(-pid, 0)).toThrow();
+    expect(() => process.kill(-childPid, 0)).toThrow();
+    expect(db.db.prepare("SELECT * FROM job_processes WHERE job_id = ?").all(jobId)).toEqual([]);
     await worker.shutdown();
     db.close();
   });

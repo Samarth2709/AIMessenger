@@ -65,6 +65,7 @@ export class AppDatabase {
         user_message_id INTEGER NOT NULL,
         provider TEXT NOT NULL CHECK(provider IN ('codex', 'claude')),
         prompt TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'normal' CHECK(mode IN ('normal', 'deep_research')),
         attachments_json TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed', 'canceled', 'interrupted')),
         retry_of INTEGER,
@@ -74,6 +75,8 @@ export class AppDatabase {
         result_text TEXT,
         process_pid INTEGER,
         model TEXT,
+        requested_model TEXT,
+        fallback_reason TEXT,
         cost_usd REAL,
         cost_credits REAL,
         input_tokens INTEGER,
@@ -87,6 +90,14 @@ export class AppDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS jobs_status_id ON jobs(status, id);
+
+      CREATE TABLE IF NOT EXISTS job_processes (
+        job_id INTEGER NOT NULL,
+        pid INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        PRIMARY KEY(job_id, pid),
+        FOREIGN KEY(job_id) REFERENCES jobs(id)
+      );
 
       CREATE TABLE IF NOT EXISTS live_conversations (
         chat_id INTEGER PRIMARY KEY,
@@ -162,6 +173,9 @@ export class AppDatabase {
       ["cached_input_tokens", "INTEGER"],
       ["output_tokens", "INTEGER"],
       ["usage_recorded_at", "TEXT"],
+      ["mode", "TEXT NOT NULL DEFAULT 'normal'"],
+      ["requested_model", "TEXT"],
+      ["fallback_reason", "TEXT"],
     ] as const;
     for (const [name, type] of additions) {
       if (!jobColumns.some((column) => column.name === name)) {
@@ -243,6 +257,13 @@ export class AppDatabase {
     })();
   }
 
+  clearSelectedModel(provider: ProviderName): void {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM settings WHERE key = ?").run(`selected_model_${provider}`);
+      this.resetProvider(provider);
+    })();
+  }
+
   recordAndSetActiveProvider(input: {
     updateId: number;
     telegramMessageId: number;
@@ -309,6 +330,7 @@ export class AppDatabase {
     provider: ProviderName;
     prompt: string;
     attachments: RemoteAttachment[];
+    mode?: import("./types.js").JobMode;
     retryOf?: number;
   }): number {
     return this.db.transaction(() => {
@@ -318,8 +340,8 @@ export class AppDatabase {
       const job = this.db
         .prepare(
           `INSERT INTO jobs
-            (update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, attachments_json, status, retry_of)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+            (update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, mode, attachments_json, status, retry_of)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
         )
         .run(
           input.updateId,
@@ -328,6 +350,7 @@ export class AppDatabase {
           Number(message.lastInsertRowid),
           input.provider,
           input.prompt,
+          input.mode ?? "normal",
           JSON.stringify(input.attachments),
           input.retryOf ?? null,
         );
@@ -344,6 +367,7 @@ export class AppDatabase {
     prompt: string;
     body: string;
     attachments: RemoteAttachment[];
+    mode?: import("./types.js").JobMode;
   }): { fresh: boolean; jobId?: number } {
     return this.db.transaction(() => {
       const inserted = this.db
@@ -362,8 +386,8 @@ export class AppDatabase {
       const job = this.db
         .prepare(
           `INSERT INTO jobs
-            (update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, attachments_json, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')`,
+            (update_id, telegram_message_id, chat_id, user_message_id, provider, prompt, mode, attachments_json, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')`,
         )
         .run(
           input.updateId,
@@ -372,6 +396,7 @@ export class AppDatabase {
           Number(message.lastInsertRowid),
           input.provider,
           input.prompt,
+          input.mode ?? "normal",
           JSON.stringify(input.attachments),
         );
       return { fresh: true, jobId: Number(job.lastInsertRowid) };
@@ -463,6 +488,7 @@ export class AppDatabase {
       provider: original.provider,
       prompt: original.prompt,
       attachments: JSON.parse(original.attachments_json) as RemoteAttachment[],
+      mode: original.mode,
       retryOf: original.id,
     });
   }
@@ -697,7 +723,7 @@ export class AppDatabase {
         .prepare("SELECT DISTINCT provider FROM jobs WHERE status = 'running'")
         .all() as Array<{ provider: ProviderName }>;
       for (const { provider } of providers) this.taintProvider(provider);
-      return this.db
+      const recovered = this.db
         .prepare(
           `UPDATE jobs SET status = 'interrupted', finished_at = CURRENT_TIMESTAMP,
             error = 'Service restarted while the agent was running; use /retry to run it again.',
@@ -705,6 +731,14 @@ export class AppDatabase {
            WHERE status = 'running'`,
         )
         .run().changes;
+      if (recovered) {
+        this.db
+          .prepare(
+            "DELETE FROM job_processes WHERE job_id IN (SELECT id FROM jobs WHERE status = 'interrupted')",
+          )
+          .run();
+      }
+      return recovered;
     })();
   }
 
@@ -726,13 +760,15 @@ export class AppDatabase {
       this.db
         .prepare(
           `UPDATE jobs SET status = 'completed', result_text = ?, finished_at = CURRENT_TIMESTAMP,
-            error = NULL, process_pid = NULL, model = ?, cost_usd = ?, cost_credits = ?,
+            error = NULL, process_pid = NULL, model = ?, requested_model = ?, fallback_reason = ?, cost_usd = ?, cost_credits = ?,
             input_tokens = ?, cached_input_tokens = ?, output_tokens = ?, usage_recorded_at = CURRENT_TIMESTAMP
            WHERE id = ?`,
         )
         .run(
           resultText,
           metrics?.model ?? null,
+          metrics?.requestedModel ?? null,
+          metrics?.fallbackReason ?? null,
           metrics?.costUsd ?? null,
           metrics?.codexCredits ?? null,
           metrics?.usage?.inputTokens ?? null,
@@ -740,6 +776,7 @@ export class AppDatabase {
           metrics?.usage?.outputTokens ?? null,
           id,
         );
+      this.db.prepare("DELETE FROM job_processes WHERE job_id = ?").run(id);
       this.db
         .prepare(
           `UPDATE provider_sessions SET session_id = ?, last_message_id = ?, tainted = 0
@@ -765,13 +802,15 @@ export class AppDatabase {
     this.db
       .prepare(
         `UPDATE jobs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP, process_pid = NULL,
-          model = ?, cost_usd = ?, cost_credits = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
+          model = ?, requested_model = ?, fallback_reason = ?, cost_usd = ?, cost_credits = ?, input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
           usage_recorded_at = CURRENT_TIMESTAMP WHERE id = ?`,
       )
       .run(
         status,
         error,
         metrics?.model ?? null,
+        metrics?.requestedModel ?? null,
+        metrics?.fallbackReason ?? null,
         metrics?.costUsd ?? null,
         metrics?.codexCredits ?? null,
         metrics?.usage?.inputTokens ?? null,
@@ -779,6 +818,7 @@ export class AppDatabase {
         metrics?.usage?.outputTokens ?? null,
         id,
       );
+    this.db.prepare("DELETE FROM job_processes WHERE job_id = ?").run(id);
   }
 
   costSummary(since?: string): CostSummary {
@@ -850,12 +890,28 @@ export class AppDatabase {
     this.db.prepare("UPDATE jobs SET process_pid = ? WHERE id = ? AND status = 'running'").run(pid, id);
   }
 
+  addJobProcess(jobId: number, pid: number, kind: string): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO job_processes(job_id, pid, kind) VALUES (?, ?, ?)")
+      .run(jobId, pid, kind);
+  }
+
+  removeJobProcess(jobId: number, pid: number): void {
+    this.db.prepare("DELETE FROM job_processes WHERE job_id = ? AND pid = ?").run(jobId, pid);
+  }
+
   runningProcessPids(): number[] {
-    return (
-      this.db
-        .prepare("SELECT process_pid FROM jobs WHERE status = 'running' AND process_pid IS NOT NULL")
-        .all() as Array<{ process_pid: number }>
-    ).map((row) => row.process_pid);
+    const parent = this.db
+      .prepare("SELECT process_pid AS pid FROM jobs WHERE status = 'running' AND process_pid IS NOT NULL")
+      .all() as Array<{ pid: number }>;
+    const children = this.db
+      .prepare(
+        `SELECT job_processes.pid FROM job_processes
+         JOIN jobs ON jobs.id = job_processes.job_id
+         WHERE jobs.status = 'running'`,
+      )
+      .all() as Array<{ pid: number }>;
+    return [...new Set([...parent, ...children].map((row) => row.pid))];
   }
 
   taintProvider(provider: ProviderName): void {

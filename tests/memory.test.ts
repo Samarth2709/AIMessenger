@@ -67,6 +67,22 @@ afterEach(() => {
 });
 
 describe("user Markdown memory vault", () => {
+  it("captures and removes an explicit weather default outside an agent tool loop", () => {
+    const { db, memory } = fixture();
+    db.recordUpdate(9, 19, 20_000, 30_000, "/remember Always use NYC for weather.");
+    const commands = memory as unknown as {
+      rememberPreference(updateId: number, statement: string): boolean;
+      listPreferences(): string[];
+      forgetPreference(statement: string): boolean;
+    };
+
+    expect(commands.rememberPreference(9, "Always use NYC for weather.")).toBe(true);
+    expect(commands.listPreferences()).toEqual(["Always use NYC for weather."]);
+    expect(commands.forgetPreference("Always use NYC for weather.")).toBe(true);
+    expect(commands.listPreferences()).toEqual([]);
+    db.close();
+  });
+
   it("records a directly stated user fact with current-message provenance", () => {
     const { db, memory } = fixture();
     const prompt = "My name is Sam.";

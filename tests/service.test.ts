@@ -7,6 +7,7 @@ import { AppDatabase } from "../src/db.js";
 import { codexCreditsForUsage } from "../src/pricing.js";
 import type { AppLogger } from "../src/logger.js";
 import type { LiveCodexConversations } from "../src/live-conversations.js";
+import { MemoryService } from "../src/memory.js";
 import type { ModelCatalog } from "../src/models.js";
 import { TelegramAgentService } from "../src/service.js";
 import type { TelegramClient, TelegramUpdate } from "../src/telegram.js";
@@ -166,6 +167,54 @@ describe("TelegramAgentService", () => {
     await handle(service, update(17, "/skills"));
 
     expect(sent.at(-1)).toContain("research: Research current facts.");
+    db.close();
+  });
+
+  it("stores explicit preferences and exposes them through memory commands", async () => {
+    const { service, db, sent } = fixture();
+
+    await handle(service, update(17, "/remember Always use NYC for weather."));
+    await handle(service, update(18, "/memory"));
+    await handle(service, update(19, "/forget Always use NYC for weather."));
+
+    expect(sent).toContain("I’ll remember that preference.");
+    expect(sent.some((text) => text.includes("Always use NYC for weather."))).toBe(true);
+    expect(sent).toContain("Forgot that preference.");
+    db.close();
+  });
+
+  it("auto-saves only an unambiguous standalone preference", async () => {
+    const { service, db, config } = fixture();
+    const memory = new MemoryService({
+      memoryDir: path.join(config.AIMESSENGER_DATA_DIR, "memory"),
+      databasePath: path.join(config.AIMESSENGER_DATA_DIR, "aimessenger.sqlite"),
+      cliPath: path.join(config.appRoot, "memory-cli.js"),
+      db,
+    });
+
+    await handle(service, update(21, "Always use NYC for weather."));
+    await handle(service, update(22, "Send the report after reviewing it."));
+
+    expect(memory.listPreferences()).toEqual(["Always use NYC for weather."]);
+    db.close();
+  });
+
+  it("queues explicit deep research outside the live conversation path", async () => {
+    const liveCodex = {
+      start: vi.fn(async () => undefined),
+      shutdown: vi.fn(async () => undefined),
+      accept: vi.fn(async () => true),
+      status: vi.fn(() => ({ active: false })),
+      stop: vi.fn(async () => false),
+      reset: vi.fn(async () => undefined),
+    } satisfies LiveCodexConversations;
+    const { service, db, worker } = fixture(liveCodex);
+
+    await handle(service, update(20, "/research compare local transcription options"));
+
+    expect(liveCodex.accept).not.toHaveBeenCalled();
+    expect(worker.notify).toHaveBeenCalledOnce();
+    expect(db.claimNextJob()).toMatchObject({ mode: "deep_research", prompt: "compare local transcription options" });
     db.close();
   });
 

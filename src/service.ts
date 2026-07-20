@@ -1,7 +1,9 @@
 import { displayProviderModel, getProviderModel, isGatewayModel, type Config } from "./config.js";
+import path from "node:path";
 import { HELP_TEXT, parseCommand } from "./commands.js";
 import type { AppDatabase } from "./db.js";
 import type { AppLogger } from "./logger.js";
+import { MemoryService } from "./memory.js";
 import type { LiveCodexConversations } from "./live-conversations.js";
 import { extractRemoteAttachments } from "./media.js";
 import type { ModelCatalog, ModelOption } from "./models.js";
@@ -19,6 +21,7 @@ import type { TelegramClient, TelegramMessage, TelegramUpdate } from "./telegram
 import type { JobWorker } from "./worker.js";
 
 const TELEGRAM_START_RETRY_MS = 3_000;
+const DEEP_RESEARCH_PATTERN = /\b(?:deep|thorough|comprehensive)\s+research\b|\bresearch\s+deeply\b/i;
 
 function startOfLocalDaySql(days: number): string {
   const date = new Date();
@@ -76,6 +79,7 @@ export class TelegramAgentService {
   private pollPromise?: Promise<void>;
   private pendingModelSelectionChatId?: number;
   private startRetryWake?: () => void;
+  private readonly memory: MemoryService;
 
   constructor(
     private readonly db: AppDatabase,
@@ -85,7 +89,17 @@ export class TelegramAgentService {
     private readonly logger: AppLogger,
     private readonly modelCatalog: ModelCatalog,
     private readonly liveCodex?: LiveCodexConversations,
-  ) {}
+    memory?: MemoryService,
+  ) {
+    this.memory =
+      memory ??
+      new MemoryService({
+        memoryDir: config.memoryDir ?? path.join(config.AIMESSENGER_DATA_DIR, "memory"),
+        databasePath: config.databasePath ?? path.join(config.AIMESSENGER_DATA_DIR, "aimessenger.sqlite"),
+        cliPath: config.memoryCliPath ?? path.join(config.appRoot, "dist", "src", "memory-cli.js"),
+        db,
+      });
+  }
 
   async start(): Promise<void> {
     if (this.active) return;
@@ -256,6 +270,10 @@ export class TelegramAgentService {
       await this.telegram.sendText(message.chat.id, "Retry queued.");
       return;
     }
+    if (command.kind === "research") {
+      await this.enqueueMessage(update, message, command.prompt, { forceDeepResearch: true });
+      return;
+    }
     const fresh = this.db.recordUpdate(
       update.update_id,
       message.message_id,
@@ -282,6 +300,32 @@ export class TelegramAgentService {
         await this.telegram.sendText(
           message.chat.id,
           `${list}\n\nAsk Iris to use a skill by name, or make a request matching its description.`,
+        );
+        return;
+      }
+      case "remember": {
+        const saved = this.memory.rememberPreference(update.update_id, command.statement);
+        await this.telegram.sendText(
+          message.chat.id,
+          saved
+            ? "I’ll remember that preference."
+            : "I can save clear durable preferences such as “Always use NYC for weather.”",
+        );
+        return;
+      }
+      case "forget": {
+        const removed = this.memory.forgetPreference(command.statement);
+        await this.telegram.sendText(
+          message.chat.id,
+          removed ? "Forgot that preference." : "That preference is not currently saved.",
+        );
+        return;
+      }
+      case "memory": {
+        const preferences = this.memory.listPreferences();
+        await this.telegram.sendText(
+          message.chat.id,
+          preferences.length ? `Saved preferences:\n${preferences.map((item) => `- ${item}`).join("\n")}` : "No saved preferences.",
         );
         return;
       }
@@ -460,6 +504,7 @@ export class TelegramAgentService {
     update: TelegramUpdate,
     message: TelegramMessage,
     body: string,
+    options: { forceDeepResearch?: boolean } = {},
   ): Promise<void> {
     let attachments;
     try {
@@ -489,11 +534,13 @@ export class TelegramAgentService {
     const prompt = body || "Inspect the attached file and report the useful findings.";
     const provider = this.db.getActiveProvider(this.config.DEFAULT_PROVIDER);
     const model = this.currentModel(provider);
+    const deepResearch = attachments.length === 0 && (options.forceDeepResearch || DEEP_RESEARCH_PATTERN.test(body));
     if (
       provider === "codex" &&
       this.config.CODEX_LIVE_CONVERSATIONS &&
       attachments.length === 0 &&
       body &&
+      !deepResearch &&
       !isGatewayModel(this.config, model) &&
       this.liveCodex
     ) {
@@ -505,7 +552,10 @@ export class TelegramAgentService {
         body,
         model,
       });
-      if (handled) return;
+      if (handled) {
+        this.memory.rememberPreference(update.update_id, body);
+        return;
+      }
     }
     const queued = this.db.enqueueInboundJob({
       updateId: update.update_id,
@@ -516,14 +566,17 @@ export class TelegramAgentService {
       prompt,
       body,
       attachments,
+      mode: deepResearch ? "deep_research" : "normal",
     });
     if (!queued.fresh || !queued.jobId) return;
+    this.memory.rememberPreference(update.update_id, body);
     this.logger.info("job.queued", {
       job_id: queued.jobId,
       provider,
       update_id: update.update_id,
       text_length: body.length,
       attachment_count: attachments.length,
+      mode: deepResearch ? "deep_research" : "normal",
     });
     this.worker.notify();
   }

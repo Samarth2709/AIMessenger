@@ -125,6 +125,37 @@ describe("AppDatabase", () => {
     db.close();
   });
 
+  it("clears an incompatible model selection and its provider session", () => {
+    const db = createDb();
+    db.setSelectedModel("codex", "gateway-model");
+    db.clearSelectedModel("codex");
+
+    expect(db.getSelectedModel("codex")).toBeUndefined();
+    expect(db.getProviderSession("codex").session_id).toBeNull();
+    db.close();
+  });
+
+  it("preserves deep-research mode when a failed job is retried", () => {
+    const db = createDb();
+    db.recordUpdate(11, 21, 31, 41, "Research this deeply");
+    const original = db.enqueueJob({
+      updateId: 11,
+      telegramMessageId: 21,
+      chatId: 31,
+      provider: "codex",
+      prompt: "Research this deeply",
+      attachments: [],
+      mode: "deep_research",
+    });
+    db.failJob(original, "failed", "three tracks did not complete");
+    db.recordUpdate(12, 22, 31, 41, "/retry 1");
+
+    const retry = db.retryJob(original, 12, 22);
+
+    expect(db.getJob(retry!)!).toMatchObject({ retry_of: original, mode: "deep_research" });
+    db.close();
+  });
+
   it("marks running jobs interrupted instead of retrying them", () => {
     const db = createDb();
     db.recordUpdate(11, 21, 31, 41, "do work");

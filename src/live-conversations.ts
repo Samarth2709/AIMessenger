@@ -9,6 +9,7 @@ import { parseAgentResult, buildPrompt } from "./providers/structured.js";
 import { codexCreditsForUsage } from "./pricing.js";
 import { loadSkills } from "./skills.js";
 import { MemoryService } from "./memory.js";
+import { buildConversationContext } from "./conversation-context.js";
 import type { TelegramClient } from "./telegram.js";
 import type { TokenUsage } from "./types.js";
 
@@ -235,6 +236,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
         job.prompt,
         this.memory.contextForJob(job.id),
         [],
+        buildConversationContext(this.db, job),
       );
       const outputSchema = JSON.parse(
         fs.readFileSync(path.join(this.config.appRoot, "schemas", "agent-result.schema.json"), "utf8"),

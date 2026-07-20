@@ -2,6 +2,13 @@
 
 AIMessenger turns a private Telegram bot into an unrestricted Codex or Claude coding-agent session running on your own machine. It accepts text, images, and common documents, preserves separate native provider sessions, and returns text or generated files through Telegram.
 
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md): request routing, durable state, skills, release boundaries, and delivery behavior.
+- [Raspberry Pi operations](docs/PI-OPERATIONS.md): hardened service layout, deploy, verification, rollback, logs, and safe data inspection.
+- [Cost accounting](docs/COSTS.md): `/cost` semantics, provider telemetry, stored fields, and read-only database inspection.
+- [Self-update design](SELF_UPDATE_PLAN.md): the release workflow's threat model and implementation plan.
+
 ## Security warning
 
 This service deliberately launches Codex and Claude with all approval and sandbox checks disabled. A message from the allowlisted Telegram account can read or change files, run programs, access the network, and use whatever credentials the local OS user can access. Prompt injection in a website or attachment can cause the same effects. Run it only under an account and on a host where that risk is acceptable.
@@ -73,11 +80,11 @@ npm run health
 
 Text-only messages sent while using a standard Codex model run through one persistent Codex App Server conversation. Iris sends Codex's first real progress message, keeps Telegram's typing indicator active, and then sends the completed result. A later Telegram message while that turn is running is injected immediately with Codex `turn/steer`; it does not become a separate job or produce an intermediate Telegram reply. The App Server's tool output and reasoning are not sent to Telegram.
 
-Claude, AI Security gateway models, and any message with a Telegram attachment continue through the durable one-job worker. They preserve the existing media handling and outbox behavior until they have equivalent streaming adapters. The two providers keep their own native session IDs. When switching, transcript entries unseen by the target provider are injected for continuity.
+Claude, AI Security gateway models, and any message with a Telegram attachment continue through the durable one-job worker. They preserve the existing media handling and outbox behavior until they have equivalent streaming adapters. Native provider sessions are retained only for an explicitly continuing task; switching providers uses the Markdown vault and on-demand history tools rather than replaying unseen transcript turns.
 
 Normal messages receive no queue acknowledgement. Telegram shows its typing indicator while the worker runs, then AIMessenger sends only the final agent response. Job IDs remain internal unless you explicitly use `/status`, `/stop`, or `/retry`.
 
-`/status` reports the active provider, runtime, selected model, live Codex state, and self-update state. `/model` obtains the Codex catalog directly from the installed CLI and also reads the configured local LiteLLM gateway. `CODEX_MODEL` or `CLAUDE_MODEL` remains the fallback until a model is selected through Telegram. Selecting a model or using `/new codex` interrupts and clears any live Codex thread so the next message starts fresh.
+`/status` reports the active provider, runtime, selected model, live Codex state, and self-update state. `/model` obtains the Codex catalog directly from the installed CLI and also reads the configured local LiteLLM gateway. `CODEX_MODEL` or `CLAUDE_MODEL` remains the fallback until a model is selected through Telegram. Selecting a model or using `/new codex` interrupts and clears any live Codex thread so the next message starts fresh; neither action deletes durable memory.
 
 ## Identity
 
@@ -107,6 +114,14 @@ ssh -t home-pi 'sudo -u aimessenger nano /srv/aimessenger-workspace/source/skill
 ```
 
 Keep changes in this repository too, because the next deployment copies its `skills/` directory to the Pi.
+
+## Memory
+
+Iris keeps durable, provider-neutral memory as Markdown under `memory/` inside the runtime data directory. The vault contains a compact `INDEX.md`, global profile/preference/decision pages, and project, task, topic, and archive documents. Markdown is the canonical semantic memory; the SQLite database remains the private exact transcript and job archive.
+
+Each new request receives only the compact memory index, never a replay of prior conversation turns. Codex and Claude can use the installed `memory` skill and its local CLI to search, read, and update the vault. Gateway models must support OpenAI-compatible function tools and use the same search/read/write operations through the gateway tool loop; a model that cannot honor those calls fails rather than silently losing memory access.
+
+Agents retrieve exact raw messages only through bounded history search/read operations when Markdown memory is insufficient. A completed task can hand off its native provider session after recording useful state, so a later Codex, Claude, or gateway session begins fresh and retrieves only the relevant documents.
 
 ## Self updates
 

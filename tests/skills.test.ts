@@ -13,6 +13,24 @@ afterEach(() => {
 });
 
 describe("skills", () => {
+  it("discovers the bundled deep-research workflow for parallel investigation", () => {
+    const skillPath = path.resolve("skills", "deep-research", "SKILL.md");
+    const source = fs.readFileSync(skillPath, "utf8");
+
+    const catalog = loadSkills(path.resolve("skills"));
+    const skill = catalog.skills.find((candidate) => candidate.name === "deep-research");
+
+    expect(skill).toEqual({
+      name: "deep-research",
+      description:
+        "Conduct comprehensive, source-backed research by coordinating five to ten parallel sub-agents with distinct investigation tracks, then synthesizing their findings.",
+      path: skillPath,
+    });
+    expect(source).toContain("Create **five to ten** independent, non-overlapping research tracks.");
+    expect(source).toContain("Launch one sub-agent per track in parallel");
+    expect(source).toContain("Synthesize rather than concatenate.");
+  });
+
   it("discovers standard SKILL.md files and renders a provider-neutral catalog", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-skills-"));
     directories.push(root);

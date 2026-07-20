@@ -91,4 +91,44 @@ describe("parseAgentResult", () => {
     expect(prompt).toContain("History search always excludes the current inbound message");
     expect(prompt).not.toContain("conversation_context");
   });
+
+  it("adds bounded raw history only when the service has identified a follow-up", () => {
+    const prompt = buildPrompt(
+      "# Iris",
+      [],
+      { provider: "codex", model: "test-model" },
+      "Complete my request",
+      undefined,
+      [],
+      undefined,
+      "[user] Find a used MacBook Pro.\n\n[assistant] I found two listings.",
+    );
+
+    expect(prompt).toContain("<private_conversation_context>");
+    expect(prompt).toContain("MacBook Pro");
+  });
+
+  it("injects a bounded local transcript only when transcription succeeds", () => {
+    const withTranscript = buildPrompt(
+      "# Iris",
+      [],
+      { provider: "codex", model: "test-model" },
+      "Summarize this note",
+      undefined,
+      ["/jobs/1/input/voice.ogg"],
+      "- voice.ogg [00:00] (en): Schedule the meeting for noon.",
+    );
+    const withoutTranscript = buildPrompt(
+      "# Iris",
+      [],
+      { provider: "codex", model: "test-model" },
+      "Inspect this file",
+      undefined,
+      ["/jobs/2/input/file.pdf"],
+    );
+
+    expect(withTranscript).toContain("<attachment_transcripts>");
+    expect(withTranscript).toContain("Schedule the meeting for noon.");
+    expect(withoutTranscript).not.toContain("<attachment_transcripts>");
+  });
 });

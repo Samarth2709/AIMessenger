@@ -11,6 +11,7 @@ import { ProcessError, runProcess } from "./process.js";
 export class CodexProvider implements AgentProvider {
   constructor(
     private readonly command = "codex",
+    private readonly executionMode: "standard" | "research_read_only" = "standard",
   ) {}
 
   async run(input: ProviderRunInput): Promise<ProviderRunOutput> {
@@ -21,13 +22,17 @@ export class CodexProvider implements AgentProvider {
       input.prompt,
       input.memory,
       input.attachmentPaths,
+      input.attachmentContext,
+      input.conversationContext,
     );
     const shared = [
       "--json",
       ...(input.model ? ["--model", input.model] : []),
       "--ignore-user-config",
       "--skip-git-repo-check",
-      "--dangerously-bypass-approvals-and-sandbox",
+      ...(this.executionMode === "research_read_only"
+        ? ["--sandbox", "read-only", "--ephemeral"]
+        : ["--dangerously-bypass-approvals-and-sandbox"]),
       "--output-schema",
       input.schemaPath,
     ];

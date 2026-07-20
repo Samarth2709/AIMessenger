@@ -23,6 +23,8 @@ export class ClaudeProvider implements AgentProvider {
       input.prompt,
       input.memory,
       input.attachmentPaths,
+      input.attachmentContext,
+      input.conversationContext,
     );
     const schema = await fs.readFile(input.schemaPath, "utf8");
     const newSessionId = input.sessionId ?? randomUUID();

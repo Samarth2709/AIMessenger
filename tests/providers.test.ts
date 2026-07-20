@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeProvider } from "../src/providers/claude.js";
 import { CodexProvider } from "../src/providers/codex.js";
-import { GatewayProvider } from "../src/providers/gateway.js";
+import { GatewayCapabilityError, GatewayProvider } from "../src/providers/gateway.js";
 import { ModelRoutedProvider } from "../src/providers/routed.js";
 import type { AgentProvider } from "../src/providers/types.js";
 
@@ -167,6 +167,37 @@ describe("provider adapters", () => {
     expect(output.metrics).toEqual({
       usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5 },
     });
+  });
+
+  it("retries one transient gateway failure before continuing the tool loop", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "temporarily unavailable" } }), { status: 503 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  tool_calls: [
+                    {
+                      id: "call-retry",
+                      type: "function",
+                      function: { name: "memory_search", arguments: '{"query":"retry"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: "gateway recovered" } }] })));
+
+    const output = await new GatewayProvider("http://gateway.test/v1", "test-key", request).run(baseInput);
+
+    expect(output.result.message).toBe("gateway recovered");
+    expect(request).toHaveBeenCalledTimes(3);
   });
 
   it("rejects a gateway model that does not honor required memory tools", async () => {
@@ -419,12 +450,34 @@ describe("provider adapters", () => {
   it("routes configured gateway models without changing Codex behavior", async () => {
     const codex = { run: vi.fn(async () => ({ result: { message: "codex", attachments: [] }, sessionId: "c", rawOutput: "" })) } satisfies AgentProvider;
     const gateway = { run: vi.fn(async () => ({ result: { message: "gateway", attachments: [] }, sessionId: "g", rawOutput: "" })) } satisfies AgentProvider;
-    const routed = new ModelRoutedProvider(codex, gateway, new Set(["glm-5.2"]));
+    const routed = new ModelRoutedProvider(codex, gateway, new Set(["glm-5.2"]), "gpt-5.6-terra");
 
     await routed.run({ ...baseInput, model: "glm-5.2" });
     await routed.run({ ...baseInput, model: "gpt-test" });
 
     expect(gateway.run).toHaveBeenCalledTimes(1);
     expect(codex.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to Codex when a gateway model cannot complete its tool loop", async () => {
+    const codex = {
+      run: vi.fn(async () => ({ result: { message: "codex fallback", attachments: [] }, sessionId: "c", rawOutput: "" })),
+    } satisfies AgentProvider;
+    const gateway = {
+      run: vi.fn(async () => {
+        throw new GatewayCapabilityError("Gateway exceeded the memory tool-call round limit.");
+      }),
+    } satisfies AgentProvider;
+    const routed = new ModelRoutedProvider(codex, gateway, new Set(["glm-5.2"]), "gpt-5.6-terra");
+
+    const output = await routed.run({ ...baseInput, model: "glm-5.2", sessionId: "gateway-session" });
+
+    expect(output.result.message).toBe("codex fallback");
+    expect(output.routing).toEqual({
+      requestedModel: "glm-5.2",
+      fallbackReason: "Gateway exceeded the memory tool-call round limit.",
+      executedModel: "gpt-5.6-terra",
+    });
+    expect(codex.run).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.6-terra", sessionId: null }));
   });
 });

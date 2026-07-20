@@ -3,6 +3,22 @@ import { parseCommand } from "../src/commands.js";
 import { chunkText } from "../src/chunk.js";
 
 describe("parseCommand", () => {
+  it("parses research and durable-memory commands", () => {
+    expect(parseCommand("/research compare two laptop options")).toEqual({
+      kind: "research",
+      prompt: "compare two laptop options",
+    });
+    expect(parseCommand("/remember Always use NYC for weather.")).toEqual({
+      kind: "remember",
+      statement: "Always use NYC for weather.",
+    });
+    expect(parseCommand("/forget Always use NYC for weather.")).toEqual({
+      kind: "forget",
+      statement: "Always use NYC for weather.",
+    });
+    expect(parseCommand("/memory")).toEqual({ kind: "memory" });
+  });
+
   it("parses provider switches and bot-addressed commands", () => {
     expect(parseCommand("/claude")).toEqual({ kind: "switch", provider: "claude" });
     expect(parseCommand("/codex@SamarthWorkBot")).toEqual({
@@ -22,6 +38,9 @@ describe("parseCommand", () => {
     expect(parseCommand("/model 2 with context")).toEqual({ kind: "unknown", name: "/model" });
     expect(parseCommand("/model nope")).toEqual({ kind: "unknown", name: "/model" });
     expect(parseCommand("/retry nope")).toEqual({ kind: "unknown", name: "/retry" });
+    expect(parseCommand("/research")).toEqual({ kind: "unknown", name: "/research" });
+    expect(parseCommand("/remember")).toEqual({ kind: "unknown", name: "/remember" });
+    expect(parseCommand("/forget")).toEqual({ kind: "unknown", name: "/forget" });
   });
 
   it("parses cost windows", () => {

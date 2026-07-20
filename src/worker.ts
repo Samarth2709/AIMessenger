@@ -9,6 +9,9 @@ import { codexCreditsForUsage } from "./pricing.js";
 import { ProviderRunError, type AgentProvider } from "./providers/types.js";
 import { loadSkills } from "./skills.js";
 import { MemoryService } from "./memory.js";
+import { buildConversationContext } from "./conversation-context.js";
+import { DeepResearchCoordinator } from "./deep-research.js";
+import { TranscriptionService } from "./transcription.js";
 import type { ProviderName, RemoteAttachment } from "./types.js";
 import type { TelegramClient } from "./telegram.js";
 
@@ -22,6 +25,7 @@ export class JobWorker {
   private wake?: () => void;
   private acceptingJobs = true;
   private readonly memory: MemoryService;
+  private readonly transcription: TranscriptionService;
 
   constructor(
     private readonly db: AppDatabase,
@@ -30,6 +34,8 @@ export class JobWorker {
     private readonly config: Config,
     private readonly logger: AppLogger,
     memory?: MemoryService,
+    private readonly researchProvider?: AgentProvider,
+    transcription?: TranscriptionService,
   ) {
     const dataDir = config.AIMESSENGER_DATA_DIR ?? path.dirname(config.jobsDir);
     this.memory =
@@ -39,6 +45,17 @@ export class JobWorker {
         databasePath: config.databasePath ?? path.join(dataDir, "aimessenger.sqlite"),
         cliPath: config.memoryCliPath ?? path.join(config.appRoot, "dist", "src", "memory-cli.js"),
         db,
+      });
+    this.transcription =
+      transcription ??
+      new TranscriptionService({
+        enabled: config.TRANSCRIPTION_ENABLED,
+        maxSeconds: config.TRANSCRIPTION_MAX_SECONDS,
+        command:
+          config.TRANSCRIPTION_COMMAND ??
+          path.join(dataDir, "transcription-venv", "bin", "python"),
+        scriptPath: path.join(config.appRoot, "scripts", "transcribe.py"),
+        model: config.TRANSCRIPTION_MODEL,
       });
   }
 
@@ -192,26 +209,31 @@ export class JobWorker {
         remoteAttachments,
         jobDir,
       );
-      const session = this.db.getProviderSession(job.provider);
+      const transcription = await this.transcription.transcribe(remoteAttachments, attachmentPaths, signal);
+      if (transcription.transcribed || transcription.failed) {
+        this.logger.info("transcription.completed", {
+          job_id: job.id,
+          transcribed: transcription.transcribed,
+          failed: transcription.failed,
+        });
+      }
       const model = getProviderModel(
         this.config,
         job.provider,
         this.db.getSelectedModel(job.provider),
       );
-      const output = await this.providers[job.provider].run({
-        identity,
-        skills: skills.skills,
-        provider: job.provider,
-        model,
-        prompt: job.prompt,
-        memory: this.memory.contextForJob(job.id),
-        attachmentPaths,
-        sessionId: session.tainted ? null : session.session_id,
-        workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
-        schemaPath: path.join(this.config.appRoot, "schemas", "agent-result.schema.json"),
-        signal,
-        onProcessStart: (pid) => this.db.setJobProcessPid(job.id, pid),
-      });
+      const output =
+        job.mode === "deep_research" && remoteAttachments.length === 0
+          ? await this.runDeepResearch(job, identity, skills.skills, model, signal)
+          : await this.runProviderJob(
+              job,
+              identity,
+              skills.skills,
+              model,
+              attachmentPaths,
+              transcription.context,
+              signal,
+            );
       if (signal.aborted) throw new DOMException("Job canceled.", "AbortError");
       if (!output.result.message.trim() && output.result.attachments.length === 0) {
         throw new Error("Agent completed without a message or attachment.");
@@ -225,9 +247,22 @@ export class JobWorker {
         this.logger.warn("memory.handoff_rejected", { job_id: job.id, provider: job.provider });
       }
       const codexCredits =
-        job.provider === "codex" && !isGatewayModel(this.config, model)
-          ? codexCreditsForUsage(model, output.metrics?.usage)
+        job.provider === "codex" && !isGatewayModel(this.config, output.routing?.executedModel ?? model)
+          ? codexCreditsForUsage(output.routing?.executedModel ?? model, output.metrics?.usage)
           : undefined;
+      if (output.routing?.fallbackReason) {
+        this.db.clearSelectedModel(job.provider);
+        this.logger.warn("gateway.capability_fallback", {
+          job_id: job.id,
+          requested_model: output.routing.requestedModel ?? model,
+          reason: output.routing.fallbackReason,
+        });
+        await this.safeSend(
+          job.chat_id,
+          "The selected gateway model could not use its required tools, so I cleared that selection and continued with Codex.",
+          job.id,
+        );
+      }
       this.db.completeJob(
         job.id,
         output.result.message,
@@ -236,7 +271,9 @@ export class JobWorker {
         outbound,
         {
           ...output.metrics,
-          model,
+          model: output.routing?.executedModel ?? (job.mode === "deep_research" ? undefined : model),
+          requestedModel: output.routing?.requestedModel ?? model,
+          fallbackReason: output.routing?.fallbackReason,
           ...(codexCredits !== undefined ? { codexCredits } : {}),
         },
       );
@@ -250,6 +287,60 @@ export class JobWorker {
     } finally {
       clearInterval(typing);
     }
+  }
+
+  private async runProviderJob(
+    job: import("./types.js").JobRow,
+    identity: string,
+    skills: ReturnType<typeof loadSkills>["skills"],
+    model: string | undefined,
+    attachmentPaths: string[],
+    attachmentContext: string | undefined,
+    signal: AbortSignal,
+  ): Promise<import("./providers/types.js").ProviderRunOutput> {
+    const session = this.db.getProviderSession(job.provider);
+    return this.providers[job.provider].run({
+      identity,
+      skills,
+      provider: job.provider,
+      model,
+      prompt: job.prompt,
+      conversationContext: buildConversationContext(this.db, job),
+      memory: this.memory.contextForJob(job.id),
+      attachmentPaths,
+      attachmentContext,
+      sessionId: session.tainted ? null : session.session_id,
+      workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
+      schemaPath: path.join(this.config.appRoot, "schemas", "agent-result.schema.json"),
+      signal,
+      onProcessStart: (pid) => this.db.setJobProcessPid(job.id, pid),
+    });
+  }
+
+  private async runDeepResearch(
+    job: import("./types.js").JobRow,
+    identity: string,
+    skills: ReturnType<typeof loadSkills>["skills"],
+    selectedModel: string | undefined,
+    signal: AbortSignal,
+  ): Promise<import("./providers/types.js").ProviderRunOutput> {
+    const tracks = /\b(?:exhaustive|all[- ]angles|every angle|full landscape|comprehensive)\b/i.test(job.prompt) ? 10 : 5;
+    const usingSelectedCodex = job.provider === "codex" && !isGatewayModel(this.config, selectedModel);
+    await this.safeSend(
+      job.chat_id,
+      `${usingSelectedCodex ? "Starting" : "Using isolated Codex workers for"} ${tracks} parallel research tracks.`,
+      job.id,
+    );
+    const coordinator = new DeepResearchCoordinator(this.researchProvider ?? this.providers.codex, this.db, this.logger);
+    return coordinator.run({
+      job,
+      identity,
+      skills,
+      workingDirectory: this.config.jobsDir,
+      schemaPath: path.join(this.config.appRoot, "schemas", "agent-result.schema.json"),
+      signal,
+      ...(usingSelectedCodex ? { model: selectedModel } : {}),
+    });
   }
 
   private async startTyping(chatId: number): Promise<NodeJS.Timeout> {

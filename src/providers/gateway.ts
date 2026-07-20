@@ -8,6 +8,12 @@ import type { AgentProvider, ProviderRunInput, ProviderRunOutput } from "./types
 const MAX_SKILL_BYTES = 32 * 1024;
 const MAX_TOOL_CALL_ROUNDS = 4;
 
+function isTransientGatewayStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+export class GatewayCapabilityError extends Error {}
+
 function responseMessage(payload: unknown): string {
   if (!payload || typeof payload !== "object") return "";
   const choices = (payload as { choices?: unknown }).choices;
@@ -155,6 +161,24 @@ export class GatewayProvider implements AgentProvider {
     private readonly request: typeof fetch = fetch,
   ) {}
 
+  private async requestWithTransientRetry(url: string, init: RequestInit): Promise<Response> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await this.request(url, init);
+        if (attempt === 0 && isTransientGatewayStatus(response.status)) {
+          await response.body?.cancel().catch(() => undefined);
+          continue;
+        }
+        return response;
+      } catch (error) {
+        if (init.signal?.aborted || attempt === 1) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
   async run(input: ProviderRunInput): Promise<ProviderRunOutput> {
     if (!this.apiKey) throw new Error("The AI Security gateway is not configured.");
     if (!input.model) throw new Error("Choose an AI Security gateway model with /model first.");
@@ -168,6 +192,8 @@ export class GatewayProvider implements AgentProvider {
       input.prompt,
       input.memory,
       input.attachmentPaths,
+      input.attachmentContext,
+      input.conversationContext,
     ) +
       (input.skills.length
         ? "\n\n<gateway_skill_access>For a listed skill, call skill_read with its name. Do not use memory_read for skill files.</gateway_skill_access>"
@@ -182,7 +208,7 @@ export class GatewayProvider implements AgentProvider {
     let toolRounds = 0;
 
     for (let attempt = 0; attempt < MAX_TOOL_CALL_ROUNDS + 2; attempt += 1) {
-      const response = await this.request(`${this.apiBase.replace(/\/$/, "")}/chat/completions`, {
+      const response = await this.requestWithTransientRetry(`${this.apiBase.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
@@ -217,7 +243,7 @@ export class GatewayProvider implements AgentProvider {
       const calls = toolCallsFrom(payload);
       if (!calls.length) {
         if (requireToolCall && attempt === 0) {
-          throw new Error("Gateway did not honor the required memory tool call; choose a tool-capable gateway model.");
+          throw new GatewayCapabilityError("Gateway did not honor the required memory tool call; choose a tool-capable gateway model.");
         }
         const message = responseMessage(payload) || (typeof payload === "string" ? payload : "");
         if (!message.trim()) throw new Error("Gateway completed without a final response.");
@@ -231,10 +257,10 @@ export class GatewayProvider implements AgentProvider {
         };
       }
       if (toolRounds >= MAX_TOOL_CALL_ROUNDS) {
-        throw new Error("Gateway exceeded the memory tool-call round limit.");
+        throw new GatewayCapabilityError("Gateway exceeded the memory tool-call round limit.");
       }
       toolRounds += 1;
-      if (calls.length > 4) throw new Error("Gateway requested too many memory tools in one round.");
+      if (calls.length > 4) throw new GatewayCapabilityError("Gateway requested too many memory tools in one round.");
       const assistant = choiceMessage(payload);
       if (!assistant) throw new Error("Gateway returned tool calls without an assistant message.");
       messages.push({ role: "assistant", content: assistant.content ?? "", tool_calls: assistant.tool_calls });
@@ -243,10 +269,10 @@ export class GatewayProvider implements AgentProvider {
         try {
           argumentsValue = JSON.parse(call.arguments);
         } catch {
-          throw new Error(`Gateway returned invalid JSON arguments for ${call.name}.`);
+          throw new GatewayCapabilityError(`Gateway returned invalid JSON arguments for ${call.name}.`);
         }
         const fingerprint = `${call.name}:${JSON.stringify(argumentsValue)}`;
-        if (seenCalls.has(fingerprint)) throw new Error("Gateway repeated an identical memory tool call.");
+        if (seenCalls.has(fingerprint)) throw new GatewayCapabilityError("Gateway repeated an identical memory tool call.");
         seenCalls.add(fingerprint);
         let result: unknown;
         try {

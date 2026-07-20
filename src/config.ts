@@ -38,6 +38,10 @@ const schema = z.object({
   GATEWAY_MODELS: z
     .string()
     .default("glm-5.2,deepseek-v4-flash,deepseek-v4-pro"),
+  TRANSCRIPTION_ENABLED: z.coerce.boolean().default(true),
+  TRANSCRIPTION_COMMAND: z.string().optional(),
+  TRANSCRIPTION_MODEL: z.string().default("base"),
+  TRANSCRIPTION_MAX_SECONDS: z.coerce.number().int().min(1).max(3_600).default(900),
 });
 
 export type Config = z.infer<typeof schema> & {

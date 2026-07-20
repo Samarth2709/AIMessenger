@@ -45,12 +45,14 @@ async function main(): Promise<void> {
         new CodexProvider(config.CODEX_COMMAND),
         gatewayProvider,
         gatewayModels,
+        config.CODEX_MODEL,
       ),
       claude: new ClaudeProvider(config.CLAUDE_COMMAND),
     },
     config,
     logger,
     memory,
+    new CodexProvider(config.CODEX_COMMAND, "research_read_only"),
   );
   const liveCodex = new LiveCodexConversationManager(
     db,
@@ -71,6 +73,7 @@ async function main(): Promise<void> {
       new GatewayModelCatalog(config.GATEWAY_API_BASE, config.GATEWAY_API_KEY, gatewayModels),
     ]),
     liveCodex,
+    memory,
   );
 
   let telegramReady = false;

@@ -11,6 +11,8 @@ export type JobStatus =
   | "canceled"
   | "interrupted";
 
+export type JobMode = "normal" | "deep_research";
+
 export interface RemoteAttachment {
   fileId: string;
   fileName: string;
@@ -38,6 +40,8 @@ export interface TokenUsage {
 
 export interface JobMetrics {
   model?: string;
+  requestedModel?: string;
+  fallbackReason?: string;
   costUsd?: number;
   codexCredits?: number;
   usage?: TokenUsage;
@@ -69,6 +73,7 @@ export interface JobRow {
   user_message_id: number;
   provider: ProviderName;
   prompt: string;
+  mode: JobMode;
   attachments_json: string;
   status: JobStatus;
   retry_of: number | null;
@@ -78,6 +83,8 @@ export interface JobRow {
   result_text: string | null;
   process_pid: number | null;
   model: string | null;
+  requested_model: string | null;
+  fallback_reason: string | null;
   cost_usd: number | null;
   cost_credits: number | null;
   input_tokens: number | null;

@@ -8,8 +8,10 @@ export interface ProviderRunInput {
   provider: ProviderName;
   model?: string;
   prompt: string;
+  conversationContext?: string;
   memory?: MemoryPromptContext;
   attachmentPaths: string[];
+  attachmentContext?: string;
   sessionId: string | null;
   workingDirectory: string;
   schemaPath: string;
@@ -22,6 +24,11 @@ export interface ProviderRunOutput {
   sessionId: string | null;
   rawOutput: string;
   metrics?: JobMetrics;
+  routing?: {
+    requestedModel?: string;
+    executedModel?: string;
+    fallbackReason?: string;
+  };
 }
 
 export class ProviderRunError extends Error {

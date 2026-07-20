@@ -315,6 +315,55 @@ export class MemoryService {
     });
   }
 
+  rememberPreference(updateId: number, statement: string): boolean {
+    this.ensureVault();
+    const evidence = statement.trim();
+    const inbound = this.db.getInboundUpdateBody(updateId)?.trim();
+    if (!inbound || (inbound !== evidence && inbound !== `/remember ${evidence}`)) return false;
+    if (!this.isSupportedUserStatement("core/preferences.md", evidence)) return false;
+
+    const relativePath = "core/preferences.md";
+    const existing = this.loadDocument(relativePath);
+    const statements = this.userMemoryStatements(relativePath, existing.source);
+    if (!statements) throw new Error("User preferences document is malformed.");
+    if (statements.includes(evidence)) return false;
+    const sources = listValue(existing.frontmatter.sources);
+    const source = `inbound_update:${updateId}`;
+    if (!sources.includes(source)) sources.push(source);
+    this.writeAtomic(
+      this.resolvePath(relativePath),
+      this.userMemoryDocument(relativePath, existing.source, sources, [...statements, evidence]),
+    );
+    this.refreshIndex();
+    return true;
+  }
+
+  forgetPreference(statement: string): boolean {
+    this.ensureVault();
+    const evidence = statement.trim();
+    const relativePath = "core/preferences.md";
+    const existing = this.loadDocument(relativePath);
+    const statements = this.userMemoryStatements(relativePath, existing.source);
+    if (!statements) throw new Error("User preferences document is malformed.");
+    if (!statements.includes(evidence)) return false;
+    this.writeAtomic(
+      this.resolvePath(relativePath),
+      this.userMemoryDocument(
+        relativePath,
+        existing.source,
+        listValue(existing.frontmatter.sources),
+        statements.filter((item) => item !== evidence),
+      ),
+    );
+    this.refreshIndex();
+    return true;
+  }
+
+  listPreferences(): string[] {
+    this.ensureVault();
+    return this.userMemoryStatements("core/preferences.md", this.loadDocument("core/preferences.md").source) ?? [];
+  }
+
   private search(input: SearchInput): { results: Array<Record<string, unknown>> } {
     const terms = tokenise(input.query);
     if (!terms.length) throw new Error("memory_search query must include searchable text.");
@@ -545,6 +594,19 @@ export class MemoryService {
     return lines.map((line) => line.slice(2));
   }
 
+  private userMemoryDocument(
+    relativePath: string,
+    source: string,
+    sources: string[],
+    statements: string[],
+  ): string {
+    const header = `# ${this.userMemoryTitle(relativePath)}`;
+    const match = source.match(new RegExp(`^([\\s\\S]*?^${header.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\r?\\n)([\\s\\S]*)$`, "m"));
+    if (!match) throw new Error("User memory document is malformed.");
+    const withSources = match[1]!.replace(/^sources:\s*.*$/m, `sources: [${sources.join(", ")}]`);
+    return `${this.withUpdatedTimestamp(withSources).trimEnd()}\n\n${statements.map((item) => `- ${item}`).join("\n")}\n`;
+  }
+
   private isConformingUserMemoryDocument(relativePath: string, source: string): boolean {
     try {
       this.validateDocument(relativePath, source);
@@ -609,7 +671,9 @@ export class MemoryService {
       /^i want (?:concise|brief|short|direct|detailed|thorough|structured|formal|informal|technical|simple) (?:answers|responses|replies)[.!?]?$/i.test(statement) ||
       /^when i (?:ask|share|send|provide|mention|request|start) [A-Za-z0-9 '’-]{0,80} ask (?:me )?(?:a |follow-up )?questions?[.!?]?$/i.test(statement) ||
       /^(?:always|never) ask (?:me )?(?:questions?|for clarification)[.!?]?$/i.test(statement) ||
-      /^(?:always|never) (?:answer|respond|reply) (?:concisely|briefly|directly|in detail|with structure)[.!?]?$/i.test(statement)
+      /^(?:always|never) (?:answer|respond|reply) (?:concisely|briefly|directly|in detail|with structure)[.!?]?$/i.test(statement) ||
+      /^(?:always )?use [A-Za-z][A-Za-z .'’-]{1,80} for (?:the )?weather[.!?]?$/i.test(statement) ||
+      /^for (?:the )?weather(?:,)? use [A-Za-z][A-Za-z .'’-]{1,80}[.!?]?$/i.test(statement)
     );
   }
 

@@ -2,6 +2,10 @@ import type { ProviderName } from "./types.js";
 
 export type ParsedCommand =
   | { kind: "none" }
+  | { kind: "research"; prompt: string }
+  | { kind: "remember"; statement: string }
+  | { kind: "forget"; statement: string }
+  | { kind: "memory" }
   | { kind: "help" }
   | { kind: "skills" }
   | { kind: "model"; selection?: number }
@@ -29,6 +33,20 @@ export function parseCommand(text: string): ParsedCommand {
       return { kind: "help" };
     case "/skills":
       return { kind: "skills" };
+    case "/research": {
+      const prompt = trimmed.slice(rawName.length).trim();
+      return prompt ? { kind: "research", prompt } : { kind: "unknown", name: "/research" };
+    }
+    case "/remember": {
+      const statement = trimmed.slice(rawName.length).trim();
+      return statement ? { kind: "remember", statement } : { kind: "unknown", name: "/remember" };
+    }
+    case "/forget": {
+      const statement = trimmed.slice(rawName.length).trim();
+      return statement ? { kind: "forget", statement } : { kind: "unknown", name: "/forget" };
+    }
+    case "/memory":
+      return { kind: "memory" };
     case "/model": {
       if (!rawArg) return { kind: "model" };
       const argument = trimmed.slice(rawName.length).trim();
@@ -85,4 +103,8 @@ export const HELP_TEXT = `AIMessenger commands:
 /retry <job-id> — retry a failed, canceled, or interrupted job
 /model - list Codex and AI Security models, then reply with a number to select one
 /skills — list reusable workflows
+/research <question> — run a parallel, source-backed deep-research review
+/remember <preference> — save a durable personal preference
+/forget <preference> — remove a saved personal preference
+/memory — list saved personal preferences
 /help — show this list`;
