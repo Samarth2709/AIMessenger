@@ -14,6 +14,7 @@ interface ResearchTrack {
 interface CompletedTrack {
   track: ResearchTrack;
   message: string;
+  sources: string[];
   metrics?: JobMetrics;
 }
 
@@ -43,6 +44,24 @@ const EXHAUSTIVE_TRACKS: ResearchTrack[] = [
   { title: "Economics", instruction: "Assess cost, pricing, incentives, and market evidence where relevant." },
   { title: "Expert consensus", instruction: "Find high-quality expert analysis and distinguish consensus from speculation." },
 ];
+
+const MAX_TRACK_EVIDENCE_CHARS = 4_000;
+const MAX_TRACK_SOURCES = 5;
+const MIN_DISTINCT_SOURCES = 2;
+
+function directSourceUrls(message: string): string[] {
+  const urls = message.match(/https?:\/\/[^\s<>()\]]+/g) ?? [];
+  return [...new Set(urls.map((url) => url.replace(/[.,;:!?]+$/, "")))];
+}
+
+function sourceAppendix(sources: string[]): string {
+  return sources.map((source, index) => `- [Source ${index + 1}](${source})`).join("\n");
+}
+
+function includeSources(message: string, sources: string[]): string {
+  if (/^#{0,6}\s*Sources:\s*$/im.test(message)) return message;
+  return `${message.trim()}\n\nSources:\n${sourceAppendix(sources)}`;
+}
 
 function wantsExhaustiveResearch(prompt: string): boolean {
   return /\b(?:exhaustive|all[- ]angles|every angle|full landscape|comprehensive)\b/i.test(prompt);
@@ -86,6 +105,12 @@ export class DeepResearchCoordinator {
     if (completed.length < 3) {
       throw new Error(`Deep research completed only ${completed.length}/${tracks.length} tracks; at least 3 are required.`);
     }
+    const sources = [...new Set(completed.flatMap((track) => track.sources))];
+    if (sources.length < MIN_DISTINCT_SOURCES) {
+      throw new Error(
+        `Deep research found only ${sources.length} distinct direct source link${sources.length === 1 ? "" : "s"}; at least ${MIN_DISTINCT_SOURCES} are required.`,
+      );
+    }
 
     let synthesisPid: number | undefined;
     let synthesis: ProviderRunOutput;
@@ -122,9 +147,12 @@ export class DeepResearchCoordinator {
       sessionId: null,
       result: {
         ...synthesis.result,
-        message: `Research method: ${tracks.length} independent tracks (${completed.length} completed, ${failed} failed).\n\n${synthesis.result.message}`,
+        message: `Research method: ${tracks.length} independent tracks (${completed.length} completed, ${failed} failed; ${sources.length} distinct direct sources).\n\n${includeSources(synthesis.result.message, sources)}`,
         sessionDisposition: "handoff",
       },
+      ...(input.model
+        ? { routing: { requestedModel: input.model, executedModel: input.model } }
+        : {}),
       ...(usage ? { metrics: { ...synthesis.metrics, usage } } : {}),
     };
   }
@@ -155,12 +183,15 @@ export class DeepResearchCoordinator {
         },
       });
       if (!output.result.message.trim()) throw new Error("Research track returned no findings.");
+      const sources = directSourceUrls(output.result.message);
+      if (!sources.length) throw new Error("Research track returned no direct source links.");
       this.logger.info("deep_research.track_completed", {
         job_id: input.job.id,
         track: track.title,
         duration_ms: Date.now() - startedAt,
+        source_count: sources.length,
       });
-      return { track, message: output.result.message, metrics: output.metrics };
+      return { track, message: output.result.message, sources, metrics: output.metrics };
     } catch (error) {
       this.logger.warn("deep_research.track_failed", {
         job_id: input.job.id,
@@ -175,8 +206,11 @@ export class DeepResearchCoordinator {
 
   private synthesisPrompt(question: string, tracks: CompletedTrack[]): string {
     const evidence = tracks
-      .map((track) => `## ${track.track.title}\n${track.message.slice(0, 8_000)}`)
+      .map(
+        (track) =>
+          `## ${track.track.title}\nDirect source links:\n${sourceAppendix(track.sources.slice(0, MAX_TRACK_SOURCES))}\n\nFindings:\n${track.message.slice(0, MAX_TRACK_EVIDENCE_CHARS)}`,
+      )
       .join("\n\n");
-    return `<research_synthesis>\nAnswer the user’s question using the independent research tracks below. Synthesize rather than concatenate; resolve disagreements, distinguish fact from inference, and name material uncertainty. Include direct Markdown source links near supported claims.\n\nQuestion: ${question}\n\n${evidence}\n</research_synthesis>`;
+    return `<research_synthesis>\nAnswer the user’s question using the independent research tracks below. Synthesize rather than concatenate; resolve disagreements, distinguish fact from inference, and name material uncertainty. Every factual claim must be supported by a direct source link from the evidence. Prefer primary sources, systematic reviews, official guidance, or original data; flag material evidence that is old or lacks a publication date. End with a Sources section containing the direct links used.\n\nQuestion: ${question}\n\n${evidence}\n</research_synthesis>`;
   }
 }

@@ -19,7 +19,7 @@ Use this skill when the user explicitly asks for deep, thorough, or multi-perspe
    - market, policy, financial, or practical implications;
    - risks, limitations, and dissenting evidence;
    - regional, user, or stakeholder impacts.
-5. Launch one sub-agent per track in parallel when the runtime exposes collaboration tools. Give each a concrete question, required freshness window, source-quality standard, and a request to return concise, cited findings only. Do not ask sub-agents to edit files, send messages, purchase items, or make other external changes.
+5. Launch one sub-agent per track in parallel when the runtime exposes collaboration tools. Give each a concrete question, required freshness window, source-quality standard, and a request to return concise findings with direct source links. Require at least one direct link per track; record the source date when the evidence is older than three years or could have changed. Do not ask sub-agents to edit files, send messages, purchase items, or make other external changes.
 6. While they run, identify the cross-cutting facts that require confirmation and collect primary sources yourself. Do not let a single sub-agent or search-result snippet establish an important claim.
 7. Wait for every launched track or record a clear reason a track could not complete. Reassign only the missing question, not the full investigation.
 8. Synthesize rather than concatenate. Resolve contradictions against primary sources when possible; otherwise label the disagreement and the confidence level. Separate confirmed facts, informed inferences, and unknowns.
@@ -39,4 +39,4 @@ Lead with the direct conclusion in one to three short paragraphs. Then include o
 - what remains uncertain or disputed;
 - a concise practical takeaway when the request calls for one.
 
-Include a `Sources:` section with direct Markdown links near the claims they support. Do not claim that sub-agents were used if the runtime did not expose collaboration tools; say that the result is a single-agent deep review instead.
+Include direct Markdown links near the claims they support and finish with a `Sources:` section. Do not claim that sub-agents were used if the runtime did not expose collaboration tools; say that the result is a single-agent deep review instead.
