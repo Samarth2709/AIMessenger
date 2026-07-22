@@ -14,7 +14,8 @@ import type { TelegramClient } from "./telegram.js";
 import type { TokenUsage } from "./types.js";
 
 const TYPING_REFRESH_MS = 4_000;
-const FIRST_MESSAGE_GRACE_MS = 250;
+// Keep normal follow-ups as one direct answer; progress is only useful for long work.
+const INITIAL_PROGRESS_DELAY_MS = 20_000;
 
 export interface LiveCodexMessage {
   updateId: number;
@@ -90,6 +91,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
   private readonly steeringChats = new Set<number>();
   private readonly runningChats = new Set<number>();
   private readonly finalMessages = new Map<string, string>();
+  private readonly turnStartedAt = new Map<string, number>();
   private readonly turnUsage = new Map<string, TokenUsage>();
   private readonly completingTurns = new Set<string>();
   private readonly firstMessageTimers = new Map<string, NodeJS.Timeout>();
@@ -132,6 +134,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
     this.firstMessageTimers.clear();
     this.firstMessageDeliveries.clear();
     this.turnUsage.clear();
+    this.turnStartedAt.clear();
     await this.appServer?.close();
   }
 
@@ -293,6 +296,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
         await server.request("turn/interrupt", { threadId, turnId });
         return;
       }
+      this.turnStartedAt.set(this.turnKey(threadId, turnId), Date.now());
       this.logger.info("live_codex.turn_started", { chat_id: chatId, job_id: jobId });
       void this.flushSteering(chatId);
     } catch (error) {
@@ -404,6 +408,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       this.completingTurns.delete(key);
       this.finalMessages.delete(key);
       this.turnUsage.delete(key);
+      this.turnStartedAt.delete(key);
       this.discardFirstMessage(threadId, turnId);
     });
   }
@@ -560,10 +565,12 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
   private queueFirstMessage(threadId: string, turnId: string, text: string): void {
     const key = this.turnKey(threadId, turnId);
     if (!text.trim() || this.firstMessageTimers.has(key) || this.firstMessageDeliveries.has(key)) return;
+    const startedAt = this.turnStartedAt.get(key) ?? Date.now();
+    const delay = Math.max(0, INITIAL_PROGRESS_DELAY_MS - (Date.now() - startedAt));
     const timer = setTimeout(() => {
       this.firstMessageTimers.delete(key);
       this.firstMessageDeliveries.set(key, this.sendFirstAgentMessage(threadId, turnId, text));
-    }, FIRST_MESSAGE_GRACE_MS);
+    }, delay);
     timer.unref();
     this.firstMessageTimers.set(key, timer);
   }
@@ -589,6 +596,7 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
     if (timer) clearTimeout(timer);
     this.firstMessageTimers.delete(key);
     this.firstMessageDeliveries.delete(key);
+    this.turnStartedAt.delete(key);
   }
 
   private async sendFirstAgentMessage(threadId: string, turnId: string, text: string): Promise<void> {

@@ -115,17 +115,27 @@ afterEach(() => {
 });
 
 describe("LiveCodexConversationManager", () => {
-  it("sends Codex's first progress message before its completed result", async () => {
+  it("sends Codex's first progress message only after a long-running turn", async () => {
     vi.useFakeTimers();
     const { db, manager, notifyDelivery, sent } = fixture();
     await manager.start();
     const { chatId, jobId } = createRunningTurn(db, manager);
 
+    (manager as unknown as { turnStartedAt: Map<string, number> }).turnStartedAt.set(
+      "thread-1:turn-1",
+      Date.now(),
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+
     emit(
       manager,
       agentMessage('{"message":"I’ll inspect the workspace, then make the targeted change.","attachments":[]}'),
     );
-    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(9_999);
+
+    expect(sent).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
 
     expect(sent).toEqual([
       { chatId, jobId, text: "I’ll inspect the workspace, then make the targeted change." },
@@ -146,6 +156,29 @@ describe("LiveCodexConversationManager", () => {
     expect(notifyDelivery).toHaveBeenCalledOnce();
     const final = db.claimNextOutbox()!;
     expect(JSON.parse(final.payload_json)).toEqual({ text: "Implemented and verified the change." });
+    await manager.shutdown();
+    db.close();
+  });
+
+  it("suppresses a progress message when a turn finishes before the long-running threshold", async () => {
+    vi.useFakeTimers();
+    const { db, manager, sent } = fixture();
+    await manager.start();
+    const { jobId } = createRunningTurn(db, manager);
+    const progress = '{"message":"I’m checking the immediately preceding chat context.","attachments":[]}';
+    const final = '{"message":"It holds the robot safely while people work on it.","attachments":[]}';
+
+    emit(manager, agentMessage(progress));
+    await vi.advanceTimersByTimeAsync(10_000);
+    emit(manager, completed(final));
+    await flush();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(sent).toEqual([]);
+    expect(db.getJob(jobId)?.status).toBe("completed");
+    expect(JSON.parse(db.claimNextOutbox()!.payload_json)).toEqual({
+      text: "It holds the robot safely while people work on it.",
+    });
     await manager.shutdown();
     db.close();
   });
