@@ -28,6 +28,7 @@ export class CodexProvider implements AgentProvider {
     const shared = [
       "--json",
       ...(input.model ? ["--model", input.model] : []),
+      ...input.imagePaths.flatMap((imagePath) => ["--image", imagePath]),
       "--ignore-user-config",
       "--skip-git-repo-check",
       ...(this.executionMode === "research_read_only"

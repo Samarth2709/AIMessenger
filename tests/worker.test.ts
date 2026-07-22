@@ -53,6 +53,9 @@ describe("JobWorker", () => {
       if (url.endsWith("/sendMessage")) {
         return json({ message_id: nextMessageId++, chat: { id: 3, type: "private" } });
       }
+      if (url.endsWith("/sendPhoto")) {
+        return json({ message_id: nextMessageId++, chat: { id: 3, type: "private" } });
+      }
       throw new Error(`Unexpected request: ${url}`);
     }) as unknown as typeof fetch;
     const telegram = new TelegramClient("test-token-that-is-long-enough", "https://example.test", fakeFetch);
@@ -102,6 +105,17 @@ describe("JobWorker", () => {
       expect.objectContaining({ job_id: jobId, result_length: 8 }),
     );
     expect(logger.info).toHaveBeenCalledWith("telegram.typing_sent", { phase: "initial" });
+    expect(db.getJobDiagnostics(jobId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: "attachments.downloaded" }),
+      expect.objectContaining({
+        event: "provider.invoked",
+        details: expect.objectContaining({
+          attachment_input_mode: "local_paths",
+          direct_image_input: false,
+        }),
+      }),
+      expect.objectContaining({ event: "provider.completed" }),
+    ]));
     expect(vi.mocked(provider.run).mock.calls[0]?.[0].identity).toContain("You are Iris");
     expect(vi.mocked(provider.run).mock.calls[0]?.[0].skills.map((skill) => skill.name)).toContain(
       "research",
@@ -128,6 +142,35 @@ describe("JobWorker", () => {
     worker.notify();
     await vi.waitFor(() => expect(db.getJob(handoffJob)?.status).toBe("completed"));
     expect(db.getProviderSession("codex").session_id).toBeNull();
+
+    const imagePath = path.join(dir, "lucy.jpg");
+    fs.writeFileSync(imagePath, "jpeg");
+    db.recordUpdate(3, 4, 3, 4, "send an image");
+    const imageJob = db.enqueueJob({
+      updateId: 3,
+      telegramMessageId: 4,
+      chatId: 3,
+      provider: "codex",
+      prompt: "send an image",
+      attachments: [],
+    });
+    vi.mocked(provider.run).mockResolvedValueOnce({
+      result: {
+        message: "Sent Lucy Gray.",
+        attachments: [{ path: imagePath, caption: "Lucy Gray 1", provenance: "generated" }],
+        sessionDisposition: "handoff",
+        memoryRefs: [],
+      },
+      sessionId: "session-3",
+      rawOutput: "",
+    });
+    worker.notify();
+    await vi.waitFor(() => expect(db.getJob(imageJob)?.status).toBe("completed"));
+    await vi.waitFor(() => expect(db.pendingOutboxCount()).toBe(0));
+    expect(db.getProviderSession("codex").session_id).toBe("session-3");
+    expect(db.readHistory([db.getProviderSession("codex").last_message_id], 3)[0]?.attachments).toEqual(
+      expect.arrayContaining([expect.objectContaining({ deliveryStatus: "sent", provenance: "generated" })]),
+    );
     await worker.shutdown();
     db.close();
   });
@@ -196,6 +239,129 @@ describe("JobWorker", () => {
       expect.objectContaining({ job_id: jobId, requested_model: "glm-5.2" }),
     );
     expect(fetchMock.mock.calls.some(([, init]) => String((init as RequestInit).body).includes("cleared that selection"))).toBe(true);
+    await worker.shutdown();
+    db.close();
+  });
+
+  it("forwards an image attachment to Codex and records direct image input", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-worker-image-"));
+    tempDirs.push(dir);
+    const db = new AppDatabase(path.join(dir, "test.sqlite"));
+    db.recordUpdate(25, 26, 27, 28, "Read this schedule");
+    const jobId = db.enqueueJob({
+      updateId: 25,
+      telegramMessageId: 26,
+      chatId: 27,
+      provider: "codex",
+      prompt: "Read this schedule",
+      attachments: [
+        { fileId: "not-an-image", fileName: "broken.jpg", mimeType: "image/jpeg", fileSize: 16 },
+        { fileId: "schedule", fileName: "schedule.bin", mimeType: "application/octet-stream", fileSize: 68 },
+      ],
+    });
+    const telegram = {
+      downloadFile: vi.fn(async (fileId: string, destination: string) => {
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        fs.writeFileSync(
+          destination,
+          fileId === "schedule"
+            ? Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9J+7sAAAAASUVORK5CYII=", "base64")
+            : "not an image",
+        );
+      }),
+      sendTyping: vi.fn(async () => undefined),
+      sendText: vi.fn(async () => [100]),
+    } as unknown as TelegramClient;
+    const provider: AgentProvider = {
+      run: vi.fn(async (input) => ({
+        result: { message: input.imagePaths.length === 1 ? "Schedule read." : "Image missing.", attachments: [] },
+        sessionId: "image-session",
+        rawOutput: "",
+      })),
+    };
+    const config = {
+      AIMESSENGER_DATA_DIR: dir,
+      AIMESSENGER_WORKING_DIR: dir,
+      JOB_TIMEOUT_MINUTES: 1,
+      CODEX_MODEL: "gpt-5.6-terra",
+      GATEWAY_MODELS: "glm-5.2",
+      jobsDir: path.join(dir, "jobs"),
+      appRoot: path.resolve("."),
+      identityPath: path.resolve("IDENTITY.md"),
+      skillsDir: path.resolve("skills"),
+    } as Config;
+    const worker = new JobWorker(
+      db,
+      telegram,
+      { codex: provider, claude: provider },
+      config,
+      createLogger(),
+    );
+    worker.start();
+
+    await vi.waitFor(() => {
+      const currentJob = db.getJob(jobId);
+      if (currentJob?.status === "failed") throw new Error(currentJob.error ?? "Job failed.");
+      expect(currentJob?.status).toBe("completed");
+    });
+    expect(vi.mocked(provider.run).mock.calls[0]?.[0].imagePaths).toEqual([
+      path.join(dir, "jobs", String(jobId), "input", "2-schedule.bin"),
+    ]);
+    expect(db.getJobDiagnostics(jobId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: "attachments.downloaded",
+        details: expect.objectContaining({
+          declared_image_count: 1,
+          verified_image_count: 1,
+          image_header_valid: true,
+          image_dimensions: "1x1",
+        }),
+      }),
+      expect.objectContaining({
+        event: "provider.invoked",
+        details: expect.objectContaining({
+          attachment_input_mode: "codex_native_image",
+          direct_image_input: true,
+        }),
+      }),
+    ]));
+
+    db.setSelectedModel("codex", "glm-5.2");
+    db.recordUpdate(26, 27, 27, 28, "Read this schedule with fallback");
+    const fallbackJobId = db.enqueueJob({
+      updateId: 26,
+      telegramMessageId: 27,
+      chatId: 27,
+      provider: "codex",
+      prompt: "Read this schedule with fallback",
+      attachments: [{ fileId: "schedule", fileName: "schedule.bin", mimeType: "application/octet-stream", fileSize: 68 }],
+    });
+    vi.mocked(provider.run).mockResolvedValueOnce({
+      result: { message: "Schedule read after fallback.", attachments: [] },
+      sessionId: "fallback-image-session",
+      rawOutput: "",
+      routing: {
+        requestedModel: "glm-5.2",
+        executedModel: "gpt-5.6-terra",
+        fallbackReason: "Gateway could not complete the request.",
+      },
+    });
+    worker.notify();
+    await vi.waitFor(() => expect(db.getJob(fallbackJobId)?.status).toBe("completed"));
+    expect(db.getJobDiagnostics(fallbackJobId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: "provider.invoked",
+        details: expect.objectContaining({ execution_phase: "requested", direct_image_input: false }),
+      }),
+      expect.objectContaining({
+        event: "provider.invoked",
+        details: expect.objectContaining({
+          execution_phase: "fallback",
+          attachment_input_mode: "codex_native_image",
+          direct_image_input: true,
+        }),
+      }),
+    ]));
     await worker.shutdown();
     db.close();
   });

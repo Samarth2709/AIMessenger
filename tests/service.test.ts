@@ -75,6 +75,18 @@ function update(updateId: number, text: string, userId = 123): TelegramUpdate {
   };
 }
 
+function photoUpdate(updateId: number, userId = 123): TelegramUpdate {
+  return {
+    update_id: updateId,
+    message: {
+      message_id: updateId * 10,
+      from: { id: userId, is_bot: false },
+      chat: { id: userId, type: "private" },
+      photo: [{ file_id: `photo-${updateId}`, file_unique_id: `unique-${updateId}`, width: 100, height: 100, file_size: 123 }],
+    },
+  };
+}
+
 async function handle(service: TelegramAgentService, value: TelegramUpdate): Promise<void> {
   await (
     service as unknown as { handleUpdate(update: TelegramUpdate): Promise<void> }
@@ -103,6 +115,12 @@ describe("TelegramAgentService", () => {
       "job.queued",
       expect.objectContaining({ attachment_count: 0, provider: "codex", text_length: 11 }),
     );
+    expect(db.getJobDiagnostics(db.getJobByUpdate(2)!.id)).toEqual([
+      expect.objectContaining({
+        event: "ingress.accepted",
+        details: expect.objectContaining({ caption_present: true, request_is_attachment_fallback: false }),
+      }),
+    ]);
     expect(JSON.stringify(logger.info.mock.calls)).not.toContain("do the work");
     db.close();
   });
@@ -121,6 +139,27 @@ describe("TelegramAgentService", () => {
     await handle(service, update(12, "/stop"));
     expect(worker.stopCurrent).toHaveBeenCalledTimes(1);
     expect(sent.at(-1)).toContain("Stopping job #44");
+    db.close();
+  });
+
+  it("uses a captionless attachment to continue the preceding request when relevant", async () => {
+    const { service, db } = fixture();
+    await handle(service, update(40, "Use the attached schedule to plan my trip."));
+    await handle(service, photoUpdate(41));
+
+    const job = db.getJobByUpdate(41)!;
+    expect(job).toMatchObject({
+      prompt: "Inspect the attached file. If it is relevant, use it to complete the previous user request; otherwise report the useful findings.",
+    });
+    expect(db.getJobDiagnostics(job.id)).toEqual([
+      expect.objectContaining({
+        event: "ingress.accepted",
+        details: expect.objectContaining({
+          caption_present: false,
+          request_is_attachment_fallback: true,
+        }),
+      }),
+    ]);
     db.close();
   });
 
@@ -261,6 +300,50 @@ describe("TelegramAgentService", () => {
     );
     expect(db.status().queued).toBe(0);
     expect(worker.notify).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("keeps an image followed by its request on the worker path when live Codex is enabled", async () => {
+    const liveCodex = {
+      start: vi.fn(async () => undefined),
+      shutdown: vi.fn(async () => undefined),
+      accept: vi.fn(async () => true),
+      status: vi.fn(() => ({ active: false })),
+      stop: vi.fn(async () => false),
+      reset: vi.fn(async () => undefined),
+    } satisfies LiveCodexConversations;
+    const { service, db, config, worker } = fixture(liveCodex);
+    config.CODEX_LIVE_CONVERSATIONS = true;
+
+    await handle(service, photoUpdate(31));
+    await handle(service, update(32, "Please turn this schedule into an itinerary with times and locations."));
+
+    expect(liveCodex.accept).not.toHaveBeenCalled();
+    expect(worker.notify).toHaveBeenCalledTimes(2);
+    expect(db.getJob(1)).toMatchObject({ attachments_json: expect.stringContaining("photo-31") });
+    expect(db.getJob(2)).toMatchObject({ prompt: "Please turn this schedule into an itinerary with times and locations." });
+    db.close();
+  });
+
+  it("cancels a live text turn before queuing its captionless attachment", async () => {
+    const liveCodex = {
+      start: vi.fn(async () => undefined),
+      shutdown: vi.fn(async () => undefined),
+      accept: vi.fn(async () => true),
+      status: vi.fn(() => ({ active: true })),
+      stop: vi.fn(async () => false),
+      reset: vi.fn(async () => undefined),
+    } satisfies LiveCodexConversations;
+    const { service, db, config, worker } = fixture(liveCodex);
+    config.CODEX_LIVE_CONVERSATIONS = true;
+
+    await handle(service, update(41, "Build an itinerary from the schedule I am about to send."));
+    await handle(service, photoUpdate(42));
+
+    expect(liveCodex.accept).toHaveBeenCalledTimes(1);
+    expect(liveCodex.reset).toHaveBeenCalledWith(123);
+    expect(worker.notify).toHaveBeenCalledOnce();
+    expect(db.getJob(1)).toMatchObject({ prompt: expect.stringContaining("previous user request") });
     db.close();
   });
 

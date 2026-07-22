@@ -125,6 +125,35 @@ describe("AppDatabase", () => {
     db.close();
   });
 
+  it("persists privacy-bounded job diagnostics", () => {
+    const db = createDb();
+    db.recordUpdate(13, 23, 33, 43, "inspect the image");
+    const job = db.enqueueJob({
+      updateId: 13,
+      telegramMessageId: 23,
+      chatId: 33,
+      provider: "codex",
+      prompt: "inspect the image",
+      attachments: [],
+    });
+
+    db.recordJobDiagnostic(job, "attachments.downloaded", {
+      attachment_count: 1,
+      attachment_sha256: "abc123",
+    });
+
+    expect(db.getJobDiagnostics(job)).toEqual([
+      expect.objectContaining({
+        event: "attachments.downloaded",
+        details: { attachment_count: 1, attachment_sha256: "abc123" },
+      }),
+    ]);
+    expect(() => db.recordJobDiagnostic(job, "provider.invoked", { request_text: "private request" })).toThrow(
+      "private message content",
+    );
+    db.close();
+  });
+
   it("clears an incompatible model selection and its provider session", () => {
     const db = createDb();
     db.setSelectedModel("codex", "gateway-model");

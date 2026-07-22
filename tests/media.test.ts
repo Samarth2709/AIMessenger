@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { extractRemoteAttachments } from "../src/media.js";
+import { extractRemoteAttachments, inspectDownloadedAttachments } from "../src/media.js";
 import type { TelegramMessage } from "../src/telegram.js";
 
 const baseMessage: TelegramMessage = {
@@ -51,5 +54,47 @@ describe("extractRemoteAttachments", () => {
       "note",
       "sticker",
     ]);
+  });
+
+  it("records a hash and actual byte count for a downloaded attachment", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-media-"));
+    try {
+      const file = path.join(directory, "schedule.jpg");
+      fs.writeFileSync(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9J+7sAAAAASUVORK5CYII=", "base64"));
+
+      await expect(inspectDownloadedAttachments([
+        { fileId: "file", fileName: "schedule.png", mimeType: "image/png", fileSize: fs.statSync(file).size },
+      ], [file])).resolves.toEqual([
+        expect.objectContaining({
+          declaredMimeType: "image/png",
+          detectedMimeType: "image/png",
+          imageHeaderValid: true,
+          imageDimensions: "1x1",
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      ]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an invalid image header without trusting Telegram's declared MIME type", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-media-"));
+    try {
+      const file = path.join(directory, "invalid.jpg");
+      fs.writeFileSync(file, "not an image");
+
+      await expect(inspectDownloadedAttachments([
+        { fileId: "file", fileName: "invalid.jpg", mimeType: "image/jpeg", fileSize: 12 },
+      ], [file])).resolves.toEqual([
+        expect.objectContaining({
+          declaredMimeType: "image/jpeg",
+          detectedMimeType: "unknown",
+          imageHeaderValid: false,
+        }),
+      ]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

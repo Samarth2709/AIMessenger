@@ -14,6 +14,10 @@ const tempDirs: string[] = [];
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aimessenger-live-"));
   tempDirs.push(dir);
+  fs.writeFileSync(path.join(dir, "IDENTITY.md"), "You are Iris.");
+  fs.mkdirSync(path.join(dir, "skills"));
+  fs.mkdirSync(path.join(dir, "schemas"));
+  fs.writeFileSync(path.join(dir, "schemas", "agent-result.schema.json"), "{}");
   const db = new AppDatabase(path.join(dir, "test.sqlite"));
   const sent: Array<{ chatId: number; text: string; jobId?: number }> = [];
   const telegram = {
@@ -39,7 +43,7 @@ function fixture() {
   } satisfies AppLogger;
   const notifyDelivery = vi.fn();
   const manager = new LiveCodexConversationManager(db, telegram, config, logger, notifyDelivery);
-  return { db, manager, notifyDelivery, sent };
+  return { db, dir, manager, notifyDelivery, sent };
 }
 
 function createRunningTurn(db: AppDatabase, manager: LiveCodexConversationManager) {
@@ -165,6 +169,93 @@ describe("LiveCodexConversationManager", () => {
     db.close();
   });
 
+  it("records the diagnostic lifecycle for a live Codex turn", async () => {
+    const { db, manager } = fixture();
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/start") return { thread: { id: "thread-live" } };
+      if (method === "turn/start") return { turn: { id: "turn-live" } };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    (manager as unknown as {
+      appServer: {
+        start(): Promise<void>;
+        request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+        close(): Promise<void>;
+      };
+    }).appServer = {
+      start: vi.fn(async () => undefined),
+      request,
+      close: vi.fn(async () => undefined),
+    };
+    await manager.start();
+
+    await manager.accept({
+      updateId: 2,
+      telegramMessageId: 20,
+      chatId: 123,
+      userId: 123,
+      body: "Inspect this project.",
+      model: "gpt-5.6-terra",
+    });
+    await vi.waitFor(() => expect(db.getLiveConversation(123)?.active_turn_id).toBe("turn-live"));
+    const jobId = db.getLiveConversation(123)!.active_job_id!;
+    expect(db.getJobDiagnostics(jobId).map((entry) => entry.event)).toEqual([
+      "ingress.accepted",
+      "conversation_context.decided",
+      "provider.invoked",
+    ]);
+
+    emit(manager, {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-live",
+        turn: {
+          id: "turn-live",
+          status: "completed",
+          items: [{ type: "agentMessage", text: '{"message":"Done.","attachments":[]}' }],
+        },
+      },
+    });
+    await vi.waitFor(() => expect(db.getJob(jobId)?.status).toBe("completed"));
+    expect(db.getJobDiagnostics(jobId).map((entry) => entry.event)).toEqual([
+      "ingress.accepted",
+      "conversation_context.decided",
+      "provider.invoked",
+      "provider.completed",
+    ]);
+    await manager.shutdown();
+    db.close();
+  });
+
+  it("records a diagnostic when a live Codex turn fails", async () => {
+    const { db, manager } = fixture();
+    (manager as unknown as {
+      appServer: {
+        request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+        close(): Promise<void>;
+      };
+    }).appServer = {
+      request: vi.fn(async () => ({})),
+      close: vi.fn(async () => undefined),
+    };
+    await manager.start();
+    const { jobId } = createRunningTurn(db, manager);
+
+    emit(manager, {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "turn-1", status: "failed", items: [] },
+      },
+    });
+    await vi.waitFor(() => expect(db.getJob(jobId)?.status).toBe("failed"));
+    expect(db.getJobDiagnostics(jobId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: "job.failed", details: { provider: "codex", failure_kind: "live_codex" } }),
+    ]));
+    await manager.shutdown();
+    db.close();
+  });
+
   it("clears the live Codex thread after a valid task handoff", async () => {
     const { db, manager } = fixture();
     await manager.start();
@@ -176,6 +267,30 @@ describe("LiveCodexConversationManager", () => {
 
     expect(db.getJob(jobId)?.status).toBe("completed");
     expect(db.getLiveConversation(chatId)?.thread_id).toBeNull();
+    await manager.shutdown();
+    db.close();
+  });
+
+  it("retains the live Codex thread when a media result requests handoff", async () => {
+    const { db, dir, manager } = fixture();
+    const image = path.join(dir, "lucy.jpg");
+    fs.writeFileSync(image, "jpeg");
+    await manager.start();
+    const { chatId, jobId } = createRunningTurn(db, manager);
+    const final = JSON.stringify({
+      message: "Lucy Gray Baird.",
+      attachments: [
+        { path: image, caption: "Lucy Gray 1", provenance: "generated", source_url: null },
+      ],
+      session_disposition: "handoff",
+      memory_refs: [],
+    });
+
+    emit(manager, completed(final));
+    await vi.waitFor(() => expect(db.getJob(jobId)?.status).toBe("completed"));
+
+    expect(db.getLiveConversation(chatId)?.thread_id).toBe("thread-1");
+    expect(db.readHistory([db.getProviderSession("codex").last_message_id], chatId)[0]?.attachments).toHaveLength(1);
     await manager.shutdown();
     db.close();
   });

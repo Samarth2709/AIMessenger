@@ -1,7 +1,19 @@
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildPrompt, parseAgentResult } from "../src/providers/structured.js";
 
 describe("parseAgentResult", () => {
+  it("limits email access to Samarth's two specified accounts and preserves manual final sending", () => {
+    const identity = fs.readFileSync(path.resolve("IDENTITY.md"), "utf8");
+
+    expect(identity).toContain("`samarth.kumbla@gmail.com` and `sk5335@columbia.edu`");
+    expect(identity).toContain("Do not access any other connected mailbox.");
+    expect(identity).toContain('A request that says "send" is not itself confirmation.');
+    expect(identity).toContain("separate, explicit confirmation for that exact final version");
+    expect(identity).toContain("Never call a send endpoint");
+  });
+
   it("parses schema-compliant JSON from a code fence", () => {
     expect(
       parseAgentResult(

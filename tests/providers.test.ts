@@ -38,6 +38,7 @@ const baseInput = {
     },
   },
   attachmentPaths: [],
+  imagePaths: [],
   sessionId: null,
   workingDirectory: os.tmpdir(),
   schemaPath: path.resolve("schemas/agent-result.schema.json"),
@@ -61,6 +62,29 @@ describe("provider adapters", () => {
     expect(fs.readFileSync(argsFile, "utf8")).toContain("--model");
     expect(fs.readFileSync(argsFile, "utf8")).toContain("test-model");
     expect(fs.readFileSync(argsFile, "utf8")).toContain("You are Iris.");
+    fs.rmSync(argsFile, { force: true });
+  });
+
+  it("forwards image attachments to both new and resumed Codex turns", async () => {
+    const argsFile = path.join(os.tmpdir(), `aimessenger-codex-image-args-${process.pid}.txt`);
+    const command = executable(
+      `printf '%s\n' "$@" > "${argsFile}"\n` +
+        `printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"message\\":\\"image ok\\",\\"attachments\\":[]}"}}'`,
+    );
+    const imagePaths = ["/tmp/pageant-schedule.jpg", "/tmp/pageant-details.png"];
+
+    await new CodexProvider(command).run({
+      ...baseInput,
+      imagePaths,
+      sessionId: "thread-previous",
+    });
+
+    const args = fs.readFileSync(argsFile, "utf8").trim().split("\n");
+    expect(args.filter((arg) => arg === "--image")).toHaveLength(2);
+    expect(args[args.indexOf("--image") + 1]).toBe(imagePaths[0]);
+    expect(args[args.lastIndexOf("--image") + 1]).toBe(imagePaths[1]);
+    expect(args).toContain("resume");
+    expect(args).toContain("thread-previous");
     fs.rmSync(argsFile, { force: true });
   });
 

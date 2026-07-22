@@ -531,16 +531,29 @@ export class TelegramAgentService {
       );
       return;
     }
-    const prompt = body || "Inspect the attached file and report the useful findings.";
+    const prompt = body || (attachments.length
+      ? "Inspect the attached file. If it is relevant, use it to complete the previous user request; otherwise report the useful findings."
+      : "Inspect the request and report the useful findings.");
     const provider = this.db.getActiveProvider(this.config.DEFAULT_PROVIDER);
     const model = this.currentModel(provider);
     const deepResearch = attachments.length === 0 && (options.forceDeepResearch || DEEP_RESEARCH_PATTERN.test(body));
+    const liveCodexActive = provider === "codex" &&
+      this.config.CODEX_LIVE_CONVERSATIONS &&
+      this.liveCodex?.status(message.chat.id).active;
+    if (attachments.length > 0 && liveCodexActive) {
+      await this.liveCodex?.reset(message.chat.id);
+      this.logger.info("live_codex.reset_for_attachment", {
+        chat_id: message.chat.id,
+        attachment_count: attachments.length,
+      });
+    }
     if (
       provider === "codex" &&
       this.config.CODEX_LIVE_CONVERSATIONS &&
       attachments.length === 0 &&
       body &&
       !deepResearch &&
+      !this.db.hasPendingAttachmentJob(message.chat.id) &&
       !isGatewayModel(this.config, model) &&
       this.liveCodex
     ) {
@@ -569,6 +582,14 @@ export class TelegramAgentService {
       mode: deepResearch ? "deep_research" : "normal",
     });
     if (!queued.fresh || !queued.jobId) return;
+    this.db.recordJobDiagnostic(queued.jobId, "ingress.accepted", {
+      attachment_count: attachments.length,
+      attachment_mime_types: attachments.map((attachment) => attachment.mimeType).join(","),
+      caption_present: Boolean(body),
+      request_is_attachment_fallback: !body && attachments.length > 0,
+      request_length: prompt.length,
+      mode: deepResearch ? "deep_research" : "normal",
+    });
     this.memory.rememberPreference(update.update_id, body);
     this.logger.info("job.queued", {
       job_id: queued.jobId,

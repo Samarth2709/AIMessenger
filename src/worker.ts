@@ -3,13 +3,13 @@ import path from "node:path";
 import { getProviderModel, isGatewayModel, type Config } from "./config.js";
 import type { AppDatabase } from "./db.js";
 import type { AppLogger } from "./logger.js";
-import { downloadAttachments } from "./media.js";
+import { downloadAttachments, inspectDownloadedAttachments } from "./media.js";
 import { prepareResultOutbox } from "./outbound.js";
 import { codexCreditsForUsage } from "./pricing.js";
 import { ProviderRunError, type AgentProvider } from "./providers/types.js";
 import { loadSkills } from "./skills.js";
 import { MemoryService } from "./memory.js";
-import { buildConversationContext } from "./conversation-context.js";
+import { decideConversationContext } from "./conversation-context.js";
 import { DeepResearchCoordinator } from "./deep-research.js";
 import { TranscriptionService } from "./transcription.js";
 import type { ProviderName, RemoteAttachment } from "./types.js";
@@ -153,6 +153,11 @@ export class JobWorker {
       } catch (error) {
         const canceled = this.currentAbort.signal.aborted;
         const message = error instanceof Error ? error.message : String(error);
+        this.db.recordJobDiagnostic(job.id, "job.failed", {
+          canceled,
+          error_name: error instanceof Error ? error.name : typeof error,
+          error_length: message.length,
+        });
         this.db.failJob(
           job.id,
           canceled ? "canceled" : "failed",
@@ -209,6 +214,31 @@ export class JobWorker {
         remoteAttachments,
         jobDir,
       );
+      const attachmentObservations = await inspectDownloadedAttachments(
+        remoteAttachments,
+        attachmentPaths,
+      );
+      const declaredImageAttachments = attachmentObservations.filter((item) => item.declaredMimeType.startsWith("image/"));
+      const imageAttachments = attachmentObservations.filter(
+        (item) => item.imageHeaderValid && item.detectedMimeType.startsWith("image/"),
+      );
+      const imagePaths = attachmentObservations.flatMap((attachment, index) =>
+        attachment.imageHeaderValid && attachment.detectedMimeType.startsWith("image/")
+          ? [attachmentPaths[index]!]
+          : [],
+      );
+      this.db.recordJobDiagnostic(job.id, "attachments.downloaded", {
+        attachment_count: attachmentObservations.length,
+        attachment_declared_mime_types: attachmentObservations.map((item) => item.declaredMimeType).join(","),
+        attachment_detected_mime_types: attachmentObservations.map((item) => item.detectedMimeType).join(","),
+        attachment_declared_bytes: attachmentObservations.reduce((total, item) => total + item.declaredBytes, 0),
+        attachment_actual_bytes: attachmentObservations.reduce((total, item) => total + item.actualBytes, 0),
+        attachment_sha256: attachmentObservations.map((item) => item.sha256).join(","),
+        declared_image_count: declaredImageAttachments.length,
+        verified_image_count: imageAttachments.length,
+        image_header_valid: imageAttachments.length > 0,
+        image_dimensions: imageAttachments.map((item) => item.imageDimensions ?? "unknown").join(","),
+      });
       const transcription = await this.transcription.transcribe(remoteAttachments, attachmentPaths, signal);
       if (transcription.transcribed || transcription.failed) {
         this.logger.info("transcription.completed", {
@@ -222,6 +252,26 @@ export class JobWorker {
         job.provider,
         this.db.getSelectedModel(job.provider),
       );
+      const conversation = decideConversationContext(this.db, job);
+      const directImageInput = job.provider === "codex" &&
+        !isGatewayModel(this.config, model) && imageAttachments.length > 0;
+      this.db.recordJobDiagnostic(job.id, "conversation_context.decided", {
+        reason: conversation.reason,
+        reference_count: conversation.referenceCount,
+        media_reference_count: conversation.mediaReferenceCount,
+        included: Boolean(conversation.context),
+      });
+      this.db.recordJobDiagnostic(job.id, "provider.invoked", {
+        provider: job.provider,
+        model: model ?? "cli_default",
+        mode: job.mode,
+        attachment_count: attachmentObservations.length,
+        image_attachment_count: imageAttachments.length,
+        attachment_input_mode: directImageInput ? "codex_native_image" : "local_paths",
+        direct_image_input: directImageInput,
+        execution_phase: "requested",
+        conversation_context_included: Boolean(conversation.context),
+      });
       const output =
         job.mode === "deep_research" && remoteAttachments.length === 0
           ? await this.runDeepResearch(job, identity, skills.skills, model, signal)
@@ -231,7 +281,9 @@ export class JobWorker {
               skills.skills,
               model,
               attachmentPaths,
+              imagePaths,
               transcription.context,
+              conversation.context,
               signal,
             );
       if (signal.aborted) throw new DOMException("Job canceled.", "AbortError");
@@ -239,11 +291,38 @@ export class JobWorker {
         throw new Error("Agent completed without a message or attachment.");
       }
 
+      if (output.routing?.fallbackReason) {
+        const executedModel = output.routing.executedModel;
+        const fallbackUsesNativeImages = job.provider === "codex" &&
+          !isGatewayModel(this.config, executedModel) && imageAttachments.length > 0;
+        this.db.recordJobDiagnostic(job.id, "provider.invoked", {
+          provider: job.provider,
+          model: executedModel ?? "cli_default",
+          mode: job.mode,
+          attachment_count: attachmentObservations.length,
+          image_attachment_count: imageAttachments.length,
+          attachment_input_mode: fallbackUsesNativeImages ? "codex_native_image" : "local_paths",
+          direct_image_input: fallbackUsesNativeImages,
+          execution_phase: "fallback",
+          conversation_context_included: Boolean(conversation.context),
+        });
+      }
+
       const outbound = await prepareResultOutbox(output.result, job.chat_id, job.id, this.config);
+      this.db.recordJobDiagnostic(job.id, "provider.completed", {
+        result_length: output.result.message.length,
+        output_attachment_count: output.result.attachments.length,
+        outbox_count: outbound.length,
+      });
       const requestedHandoff = output.result.sessionDisposition === "handoff";
       const handoff =
-        requestedHandoff && this.memory.verifyHandoffReferences(job.id, output.result.memoryRefs);
-      if (requestedHandoff && !handoff) {
+        !output.result.attachments.length &&
+        requestedHandoff &&
+        this.memory.verifyHandoffReferences(job.id, output.result.memoryRefs);
+      if (requestedHandoff && output.result.attachments.length) {
+        this.logger.warn("media.handoff_retained", { job_id: job.id, provider: job.provider });
+      }
+      if (requestedHandoff && !handoff && !output.result.attachments.length) {
         this.logger.warn("memory.handoff_rejected", { job_id: job.id, provider: job.provider });
       }
       const codexCredits =
@@ -295,7 +374,9 @@ export class JobWorker {
     skills: ReturnType<typeof loadSkills>["skills"],
     model: string | undefined,
     attachmentPaths: string[],
+    imagePaths: string[],
     attachmentContext: string | undefined,
+    conversationContext: string | undefined,
     signal: AbortSignal,
   ): Promise<import("./providers/types.js").ProviderRunOutput> {
     const session = this.db.getProviderSession(job.provider);
@@ -305,9 +386,10 @@ export class JobWorker {
       provider: job.provider,
       model,
       prompt: job.prompt,
-      conversationContext: buildConversationContext(this.db, job),
+      conversationContext,
       memory: this.memory.contextForJob(job.id),
       attachmentPaths,
+      imagePaths,
       attachmentContext,
       sessionId: session.tainted ? null : session.session_id,
       workingDirectory: this.config.AIMESSENGER_WORKING_DIR,
@@ -378,6 +460,10 @@ export class JobWorker {
       }
       this.db.completeOutbox(outbox.id, telegramMessageId);
       this.db.recordOutbound(telegramMessageId, outbox.job_id, outbox.kind);
+      this.db.recordJobDiagnostic(outbox.job_id, "delivery.sent", {
+        kind: outbox.kind,
+        attempt: outbox.attempts + 1,
+      });
       this.logger.info("telegram.delivery_sent", {
         outbox_id: outbox.id,
         job_id: outbox.job_id,
@@ -386,6 +472,10 @@ export class JobWorker {
       });
     } catch (error) {
       this.db.retryOutbox(outbox.id, error instanceof Error ? error.message : String(error));
+      this.db.recordJobDiagnostic(outbox.job_id, "delivery.retry", {
+        kind: outbox.kind,
+        attempt: outbox.attempts + 1,
+      });
       this.logger.error("telegram.delivery_failed", error, {
         outbox_id: outbox.id,
         job_id: outbox.job_id,

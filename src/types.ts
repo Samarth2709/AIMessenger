@@ -20,9 +20,13 @@ export interface RemoteAttachment {
   fileSize: number;
 }
 
+export type AttachmentProvenance = "web" | "generated" | "local" | "unknown";
+
 export interface AgentAttachment {
   path: string;
   caption?: string;
+  provenance?: AttachmentProvenance;
+  sourceUrl?: string;
 }
 
 export interface AgentResult {
@@ -120,6 +124,14 @@ export interface OutboxInput {
   chatId: number;
   kind: "text" | "document";
   payload: { text: string } | { path: string; caption?: string };
+  media?: {
+    fileName: string;
+    mediaType: string;
+    sha256: string;
+    caption?: string;
+    provenance: AttachmentProvenance;
+    sourceUrl?: string;
+  };
 }
 
 export type LiveConversationState = "idle" | "starting" | "running";

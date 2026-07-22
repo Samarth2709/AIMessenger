@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chunkText } from "./chunk.js";
@@ -27,10 +28,19 @@ export async function prepareResultOutbox(
       const durablePath = path.join(outputDir, `${outbound.length + 1}-${path.basename(validated)}`);
       await fs.copyFile(validated, durablePath);
       await fs.chmod(durablePath, 0o600);
+      const bytes = await fs.readFile(durablePath);
       outbound.push({
         chatId,
         kind: "document",
         payload: { path: durablePath, ...(attachment.caption ? { caption: attachment.caption } : {}) },
+        media: {
+          fileName: path.basename(validated),
+          mediaType: mediaTypeFor(durablePath),
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          ...(attachment.caption ? { caption: attachment.caption } : {}),
+          provenance: attachment.provenance ?? "unknown",
+          ...(attachment.sourceUrl ? { sourceUrl: attachment.sourceUrl } : {}),
+        },
       });
     } catch (error) {
       outbound.push({
@@ -43,4 +53,24 @@ export async function prepareResultOutbox(
     }
   }
   return outbound;
+}
+
+function mediaTypeFor(filePath: string): string {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".mp4":
+      return "video/mp4";
+    case ".pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
 }

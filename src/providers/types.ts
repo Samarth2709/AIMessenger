@@ -11,6 +11,7 @@ export interface ProviderRunInput {
   conversationContext?: string;
   memory?: MemoryPromptContext;
   attachmentPaths: string[];
+  imagePaths: string[];
   attachmentContext?: string;
   sessionId: string | null;
   workingDirectory: string;

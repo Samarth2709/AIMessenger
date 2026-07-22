@@ -15,9 +15,18 @@
         "additionalProperties": false,
         "properties": {
           "path": { "type": "string" },
-          "caption": { "type": ["string", "null"] }
+          "caption": { "type": ["string", "null"] },
+          "provenance": {
+            "type": "string",
+            "enum": ["web", "generated", "local", "unknown"],
+            "description": "Use web only with the direct source URL, generated only when created during this turn, local for a pre-existing local file, and unknown when the origin cannot be evidenced."
+          },
+          "source_url": {
+            "type": ["string", "null"],
+            "description": "Required for web provenance; otherwise null."
+          }
         },
-        "required": ["path", "caption"]
+        "required": ["path", "caption", "provenance", "source_url"]
       }
     },
     "session_disposition": {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { RemoteAttachment } from "./types.js";
@@ -59,6 +60,86 @@ export async function downloadAttachments(
     paths.push(destination);
   }
   return paths;
+}
+
+export async function inspectDownloadedAttachments(
+  attachments: RemoteAttachment[],
+  attachmentPaths: string[],
+): Promise<Array<{
+  declaredMimeType: string;
+  detectedMimeType: string;
+  declaredBytes: number;
+  actualBytes: number;
+  sha256: string;
+  imageHeaderValid: boolean;
+  imageDimensions?: string;
+}>> {
+  if (attachments.length !== attachmentPaths.length) {
+    throw new Error("Downloaded attachment count did not match the queued attachment count.");
+  }
+  return Promise.all(attachments.map(async (attachment, index) => {
+    const bytes = await fs.readFile(attachmentPaths[index]!);
+    const image = inspectImageHeader(bytes);
+    return {
+      declaredMimeType: attachment.mimeType,
+      detectedMimeType: image.mimeType,
+      declaredBytes: attachment.fileSize,
+      actualBytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      imageHeaderValid: image.valid,
+      ...(image.dimensions ? { imageDimensions: image.dimensions } : {}),
+    };
+  }));
+}
+
+function inspectImageHeader(bytes: Buffer): {
+  mimeType: string;
+  valid: boolean;
+  dimensions?: string;
+} {
+  if (bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    const width = bytes.readUInt32BE(16);
+    const height = bytes.readUInt32BE(20);
+    return imageHeader("image/png", width, height, bytes.subarray(12, 16).equals(Buffer.from("IHDR")));
+  }
+  if (bytes.length >= 10 && bytes.subarray(0, 3).equals(Buffer.from("GIF"))) {
+    return imageHeader("image/gif", bytes.readUInt16LE(6), bytes.readUInt16LE(8), bytes.length >= 10);
+  }
+  if (bytes.subarray(0, 2).equals(Buffer.from([0xff, 0xd8]))) return inspectJpegHeader(bytes);
+  if (bytes.length >= 16 && bytes.subarray(0, 4).equals(Buffer.from("RIFF")) &&
+    bytes.subarray(8, 12).equals(Buffer.from("WEBP"))) {
+    return { mimeType: "image/webp", valid: bytes.length >= 16 };
+  }
+  return { mimeType: "unknown", valid: false };
+}
+
+function inspectJpegHeader(bytes: Buffer): { mimeType: string; valid: boolean; dimensions?: string } {
+  let offset = 2;
+  while (offset + 9 <= bytes.length) {
+    if (bytes[offset] !== 0xff) return { mimeType: "image/jpeg", valid: false };
+    while (bytes[offset] === 0xff) offset += 1;
+    const marker = bytes[offset++]!;
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (offset + 2 > bytes.length) break;
+    const length = bytes.readUInt16BE(offset);
+    if (length < 2 || offset + length > bytes.length) break;
+    if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) ||
+      (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf)) {
+      return imageHeader("image/jpeg", bytes.readUInt16BE(offset + 5), bytes.readUInt16BE(offset + 3), length >= 8);
+    }
+    offset += length;
+  }
+  return { mimeType: "image/jpeg", valid: false };
+}
+
+function imageHeader(mimeType: string, width: number, height: number, valid: boolean): {
+  mimeType: string;
+  valid: boolean;
+  dimensions?: string;
+} {
+  return valid && width > 0 && height > 0
+    ? { mimeType, valid: true, dimensions: `${width}x${height}` }
+    : { mimeType, valid: false };
 }
 
 export async function validateOutboundAttachment(

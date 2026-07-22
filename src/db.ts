@@ -15,6 +15,21 @@ import {
   type RemoteAttachment,
 } from "./types.js";
 
+const DIAGNOSTIC_EVENTS = [
+  "ingress.accepted",
+  "attachments.downloaded",
+  "conversation_context.decided",
+  "provider.invoked",
+  "provider.completed",
+  "job.failed",
+  "job.canceled",
+  "delivery.sent",
+  "delivery.retry",
+] as const;
+
+type JobDiagnosticEvent = typeof DIAGNOSTIC_EVENTS[number];
+type JobDiagnosticDetails = Record<string, boolean | number | string | null>;
+
 export class AppDatabase {
   readonly db: Database.Database;
 
@@ -91,6 +106,17 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS jobs_status_id ON jobs(status, id);
 
+      CREATE TABLE IF NOT EXISTS job_diagnostics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(job_id) REFERENCES jobs(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS job_diagnostics_job_id_id ON job_diagnostics(job_id, id);
+
       CREATE TABLE IF NOT EXISTS job_processes (
         job_id INTEGER NOT NULL,
         pid INTEGER NOT NULL,
@@ -161,6 +187,25 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(status, available_at, id);
 
+      CREATE TABLE IF NOT EXISTS transcript_attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        transcript_id INTEGER NOT NULL,
+        outbox_id INTEGER NOT NULL UNIQUE,
+        ordinal INTEGER NOT NULL,
+        file_name TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        caption TEXT,
+        sha256 TEXT NOT NULL,
+        provenance TEXT NOT NULL CHECK(provenance IN ('web', 'generated', 'local', 'unknown')),
+        source_url TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(transcript_id) REFERENCES transcript(id),
+        FOREIGN KEY(outbox_id) REFERENCES outbox(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS transcript_attachments_transcript_ordinal
+        ON transcript_attachments(transcript_id, ordinal);
+
       INSERT OR IGNORE INTO provider_sessions(provider) VALUES ('codex'), ('claude');
     `);
     const jobColumns = this.db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
@@ -216,6 +261,75 @@ export class AppDatabase {
     if (!hasTranscriptFts) {
       this.db.exec("INSERT INTO transcript_fts(transcript_fts) VALUES ('rebuild')");
     }
+    this.backfillTranscriptAttachments();
+  }
+
+  private backfillTranscriptAttachments(): void {
+    const legacy = this.db
+      .prepare(
+        `SELECT outbox.id AS outbox_id, outbox.job_id, outbox.payload_json,
+                jobs.chat_id, jobs.user_message_id, jobs.result_text
+         FROM outbox
+         JOIN jobs ON jobs.id = outbox.job_id
+         LEFT JOIN transcript_attachments ON transcript_attachments.outbox_id = outbox.id
+         WHERE outbox.kind = 'document'
+           AND transcript_attachments.id IS NULL
+           AND jobs.status = 'completed'
+           AND jobs.result_text IS NOT NULL
+         ORDER BY outbox.id`,
+      )
+      .all() as Array<{
+      outbox_id: number;
+      job_id: number;
+      payload_json: string;
+      chat_id: number;
+      user_message_id: number;
+      result_text: string;
+    }>;
+    if (!legacy.length) return;
+    const assistantCandidates = this.db.prepare(
+      `SELECT id FROM transcript
+       WHERE chat_id = ? AND role = 'assistant' AND id > ? AND content = ?
+       ORDER BY id LIMIT 2`,
+    );
+    const nextOrdinal = this.db.prepare(
+      "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal FROM transcript_attachments WHERE transcript_id = ?",
+    );
+    const insert = this.db.prepare(
+      `INSERT INTO transcript_attachments
+        (transcript_id, outbox_id, ordinal, file_name, media_type, caption, sha256, provenance, source_url)
+       VALUES (?, ?, ?, ?, ?, ?, 'legacy-unknown', 'unknown', NULL)`,
+    );
+    this.db.transaction(() => {
+      for (const item of legacy) {
+        let payload: Record<string, unknown>;
+        try {
+          const value = JSON.parse(item.payload_json);
+          if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+          payload = value as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (typeof payload.path !== "string") continue;
+        const assistants = assistantCandidates.all(
+          item.chat_id,
+          item.user_message_id,
+          item.result_text,
+        ) as Array<{ id: number }>;
+        if (assistants.length !== 1) continue;
+        const assistant = assistants[0]!;
+        const ordinal = nextOrdinal.get(assistant.id) as { ordinal: number };
+        const fileName = path.basename(payload.path) || "attachment";
+        insert.run(
+          assistant.id,
+          item.outbox_id,
+          ordinal.ordinal,
+          fileName,
+          mediaTypeForFileName(fileName),
+          typeof payload.caption === "string" ? payload.caption : null,
+        );
+      }
+    })();
   }
 
   close(): void {
@@ -521,6 +635,54 @@ export class AppDatabase {
     return this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(id) as JobRow | undefined;
   }
 
+  hasPendingAttachmentJob(chatId: number): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+         FROM jobs
+         WHERE chat_id = ?
+           AND status IN ('queued', 'running')
+           AND attachments_json != '[]'
+         LIMIT 1`,
+      )
+      .get(chatId) as { found: number } | undefined;
+    return Boolean(row);
+  }
+
+  recordJobDiagnostic(
+    jobId: number,
+    event: JobDiagnosticEvent,
+    details: JobDiagnosticDetails,
+  ): void {
+    validateJobDiagnostic(event, details);
+    this.db
+      .prepare("INSERT INTO job_diagnostics(job_id, event, details_json) VALUES (?, ?, ?)")
+      .run(jobId, event, JSON.stringify(details));
+  }
+
+  getJobDiagnostics(jobId: number): Array<{
+    event: string;
+    details: JobDiagnosticDetails;
+    created_at: string;
+  }> {
+    return (this.db
+      .prepare("SELECT event, details_json, created_at FROM job_diagnostics WHERE job_id = ? ORDER BY id")
+      .all(jobId) as Array<{ event: string; details_json: string; created_at: string }>)
+      .flatMap((row) => {
+        try {
+          const details = JSON.parse(row.details_json);
+          if (!details || typeof details !== "object" || Array.isArray(details)) return [];
+          return [{
+            event: row.event,
+            details: details as JobDiagnosticDetails,
+            created_at: row.created_at,
+          }];
+        } catch {
+          return [];
+        }
+      });
+  }
+
   getInboundUpdateBody(updateId: number): string | undefined {
     const row = this.db
       .prepare("SELECT body FROM inbound_updates WHERE update_id = ?")
@@ -786,8 +948,28 @@ export class AppDatabase {
       const outboxStatement = this.db.prepare(
         "INSERT INTO outbox(job_id, chat_id, kind, payload_json) VALUES (?, ?, ?, ?)",
       );
+      const attachmentStatement = this.db.prepare(
+        `INSERT INTO transcript_attachments
+          (transcript_id, outbox_id, ordinal, file_name, media_type, caption, sha256, provenance, source_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      let attachmentOrdinal = 0;
       for (const item of outbound) {
-        outboxStatement.run(id, item.chatId, item.kind, JSON.stringify(item.payload));
+        const outbox = outboxStatement.run(id, item.chatId, item.kind, JSON.stringify(item.payload));
+        if (item.media) {
+          attachmentOrdinal += 1;
+          attachmentStatement.run(
+            messageId,
+            Number(outbox.lastInsertRowid),
+            attachmentOrdinal,
+            item.media.fileName,
+            item.media.mediaType,
+            item.media.caption ?? null,
+            item.media.sha256,
+            item.media.provenance,
+            item.media.sourceUrl ?? null,
+          );
+        }
       }
       return messageId;
     })();
@@ -941,6 +1123,7 @@ export class AppDatabase {
     provider: string | null;
     created_at: string;
     snippet: string;
+    media_count: number;
   }> {
     const terms = [...new Set(query.toLowerCase().match(/[a-z0-9][a-z0-9._/-]*/g) ?? [])];
     if (!terms.length) return [];
@@ -948,7 +1131,8 @@ export class AppDatabase {
     return this.db
       .prepare(
         `SELECT transcript.id, transcript.role, transcript.provider, transcript.created_at,
-                snippet(transcript_fts, 0, '[', ']', '…', 16) AS snippet
+                snippet(transcript_fts, 0, '[', ']', '…', 16) AS snippet,
+                (SELECT COUNT(*) FROM transcript_attachments WHERE transcript_id = transcript.id) AS media_count
          FROM transcript_fts
          JOIN transcript ON transcript.id = transcript_fts.rowid
          WHERE transcript_fts MATCH ?
@@ -963,6 +1147,7 @@ export class AppDatabase {
       provider: string | null;
       created_at: string;
       snippet: string;
+      media_count: number;
     }>;
   }
 
@@ -972,11 +1157,13 @@ export class AppDatabase {
     provider: string | null;
     created_at: string;
     snippet: string;
+    media_count: number;
   }> {
     return this.db
       .prepare(
-        `SELECT id, role, provider, created_at,
-                substr(replace(replace(content, char(10), ' '), char(13), ' '), 1, 480) AS snippet
+        `SELECT transcript.id, transcript.role, transcript.provider, transcript.created_at,
+                substr(replace(replace(transcript.content, char(10), ' '), char(13), ' '), 1, 480) AS snippet,
+                (SELECT COUNT(*) FROM transcript_attachments WHERE transcript_id = transcript.id) AS media_count
          FROM transcript
          WHERE 1 = 1
          ${beforeTranscriptId ? "AND id < ?" : ""}
@@ -990,7 +1177,26 @@ export class AppDatabase {
       provider: string | null;
       created_at: string;
       snippet: string;
+      media_count: number;
     }>;
+  }
+
+  recentHistoryWithMedia(chatId: number, limit = 5, beforeTranscriptId?: number): number[] {
+    return this.db
+      .prepare(
+        `SELECT transcript.id
+         FROM transcript
+         WHERE transcript.chat_id = ?
+         ${beforeTranscriptId ? "AND transcript.id < ?" : ""}
+         AND EXISTS (
+           SELECT 1 FROM transcript_attachments
+           WHERE transcript_attachments.transcript_id = transcript.id
+         )
+         ORDER BY transcript.id DESC
+         LIMIT ?`,
+      )
+      .all(chatId, ...(beforeTranscriptId ? [beforeTranscriptId] : []), limit)
+      .map((row) => (row as { id: number }).id);
   }
 
   readHistory(ids: number[], chatId: number, maxChars = 8_000): Array<{
@@ -1000,6 +1206,15 @@ export class AppDatabase {
     created_at: string;
     content: string;
     truncated: boolean;
+    attachments: Array<{
+      fileName: string;
+      mediaType: string;
+      caption: string | null;
+      provenance: string;
+      sourceUrl: string | null;
+      deliveryStatus: "pending" | "sending" | "sent";
+      telegramMessageId: number | null;
+    }>;
   }> {
     if (!ids.length) return [];
     const placeholders = ids.map(() => "?").join(", ");
@@ -1015,6 +1230,48 @@ export class AppDatabase {
       created_at: string;
       content: string;
     }>;
+    const attachments = this.db
+      .prepare(
+        `SELECT transcript_attachments.transcript_id, transcript_attachments.file_name, transcript_attachments.media_type,
+                transcript_attachments.caption, transcript_attachments.provenance, transcript_attachments.source_url,
+                outbox.status, outbox.telegram_message_id
+         FROM transcript_attachments
+         JOIN outbox ON outbox.id = transcript_attachments.outbox_id
+         WHERE transcript_attachments.transcript_id IN (${placeholders})
+         ORDER BY transcript_attachments.transcript_id, transcript_attachments.ordinal`,
+      )
+      .all(...ids) as Array<{
+      transcript_id: number;
+      file_name: string;
+      media_type: string;
+      caption: string | null;
+      provenance: string;
+      source_url: string | null;
+      status: "pending" | "sending" | "sent";
+      telegram_message_id: number | null;
+    }>;
+    const attachmentsByTranscript = new Map<number, Array<{
+      fileName: string;
+      mediaType: string;
+      caption: string | null;
+      provenance: string;
+      sourceUrl: string | null;
+      deliveryStatus: "pending" | "sending" | "sent";
+      telegramMessageId: number | null;
+    }>>();
+    for (const attachment of attachments) {
+      const items = attachmentsByTranscript.get(attachment.transcript_id) ?? [];
+      items.push({
+        fileName: attachment.file_name,
+        mediaType: attachment.media_type,
+        caption: attachment.caption,
+        provenance: attachment.provenance,
+        sourceUrl: attachment.source_url,
+        deliveryStatus: attachment.status,
+        telegramMessageId: attachment.telegram_message_id,
+      });
+      attachmentsByTranscript.set(attachment.transcript_id, items);
+    }
     const byId = new Map(rows.map((row) => [row.id, row]));
     return ids.flatMap((id) => {
       const row = byId.get(id);
@@ -1024,6 +1281,7 @@ export class AppDatabase {
           ...row,
           content: row.content.slice(0, maxChars),
           truncated: row.content.length > maxChars,
+          attachments: attachmentsByTranscript.get(id) ?? [],
         },
       ];
     });
@@ -1121,5 +1379,39 @@ export class AppDatabase {
       .prepare("SELECT COUNT(*) AS count FROM outbox WHERE status != 'sent'")
       .get() as { count: number };
     return row.count;
+  }
+}
+
+function validateJobDiagnostic(event: JobDiagnosticEvent, details: JobDiagnosticDetails): void {
+  if (!DIAGNOSTIC_EVENTS.includes(event)) throw new Error(`Unsupported diagnostic event: ${event}`);
+  for (const [key, value] of Object.entries(details)) {
+    if (key.split("_").some((part) => ["body", "content", "message", "path", "prompt", "reply", "text"].includes(part))) {
+      throw new Error(`Diagnostic key may not contain private message content: ${key}`);
+    }
+    const isAttachmentHashList = typeof value === "string" &&
+      key === "attachment_sha256" && /^[a-f0-9]{64}(,[a-f0-9]{64})*$/.test(value);
+    if (typeof value === "string" && ((isAttachmentHashList ? value.length > 649 : value.length > 128) || /[\r\n]/.test(value))) {
+      throw new Error(`Diagnostic string is not safely bounded: ${key}`);
+    }
+  }
+}
+
+function mediaTypeForFileName(fileName: string): string {
+  switch (path.extname(fileName).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".mp4":
+      return "video/mp4";
+    case ".pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
   }
 }

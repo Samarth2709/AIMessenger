@@ -9,7 +9,7 @@ import { parseAgentResult, buildPrompt } from "./providers/structured.js";
 import { codexCreditsForUsage } from "./pricing.js";
 import { loadSkills } from "./skills.js";
 import { MemoryService } from "./memory.js";
-import { buildConversationContext } from "./conversation-context.js";
+import { decideConversationContext } from "./conversation-context.js";
 import type { TelegramClient } from "./telegram.js";
 import type { TokenUsage } from "./types.js";
 
@@ -154,6 +154,15 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       return true;
     }
 
+    this.db.recordJobDiagnostic(queued.jobId!, "ingress.accepted", {
+      attachment_count: 0,
+      attachment_mime_types: "",
+      caption_present: true,
+      request_is_attachment_fallback: false,
+      request_length: input.body.length,
+      mode: "live",
+    });
+
     this.runningChats.add(input.chatId);
     this.armTimeout(input.chatId, queued.jobId!);
     await this.startTyping(input.chatId);
@@ -178,6 +187,10 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
   async stop(chatId: number): Promise<boolean> {
     const interrupted = this.db.resetLiveConversation(chatId);
     if (!interrupted.jobId) return false;
+    this.db.recordJobDiagnostic(interrupted.jobId, "job.canceled", {
+      provider: "codex",
+      cancellation_kind: "user_stop",
+    });
     this.discardFirstMessage(interrupted.threadId, interrupted.turnId);
     this.clearChat(chatId);
     if (interrupted.threadId && interrupted.turnId) {
@@ -196,6 +209,12 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
 
   async reset(chatId: number): Promise<void> {
     const interrupted = this.db.resetLiveConversation(chatId, false);
+    if (interrupted.jobId) {
+      this.db.recordJobDiagnostic(interrupted.jobId, "job.canceled", {
+        provider: "codex",
+        cancellation_kind: "live_reset",
+      });
+    }
     this.discardFirstMessage(interrupted.threadId, interrupted.turnId);
     this.clearChat(chatId);
     if (interrupted.threadId && interrupted.turnId) {
@@ -229,14 +248,30 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       if (!identity) throw new Error("The Iris identity file is empty.");
       const skills = loadSkills(this.config.skillsDir);
       if (skills.rejected) this.logger.warn("skills.rejected", { count: skills.rejected });
+      const context = decideConversationContext(this.db, job);
+      this.db.recordJobDiagnostic(jobId, "conversation_context.decided", {
+        reason: context.reason,
+        reference_count: context.referenceCount,
+        media_reference_count: context.mediaReferenceCount,
+        included: Boolean(context.context),
+      });
+      this.db.recordJobDiagnostic(jobId, "provider.invoked", {
+        provider: "codex",
+        model: conversation.model ?? "cli_default",
+        mode: "live",
+        attachment_count: 0,
+        image_attachment_count: 0,
+        attachment_input_mode: "live_text",
+        direct_image_input: false,
+        conversation_context_included: Boolean(context.context),
+      });
       const prompt = buildPrompt(
         identity,
         skills.skills,
         { provider: "codex", model: conversation.model ?? undefined },
         job.prompt,
         this.memory.contextForJob(job.id),
-        [],
-        buildConversationContext(this.db, job),
+        { attachmentPaths: [], conversationContext: context.context },
       );
       const outputSchema = JSON.parse(
         fs.readFileSync(path.join(this.config.appRoot, "schemas", "agent-result.schema.json"), "utf8"),
@@ -407,10 +442,21 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       if (!current || current.active_job_id !== jobId) return;
       const codexCredits = codexCreditsForUsage(conversation.model ?? undefined, usage);
       const requestedHandoff = result.sessionDisposition === "handoff";
-      const handoff = requestedHandoff && this.memory.verifyHandoffReferences(jobId, result.memoryRefs);
-      if (requestedHandoff && !handoff) {
+      const handoff =
+        !result.attachments.length &&
+        requestedHandoff &&
+        this.memory.verifyHandoffReferences(jobId, result.memoryRefs);
+      if (requestedHandoff && result.attachments.length) {
+        this.logger.warn("media.handoff_retained", { chat_id: chatId, job_id: jobId, provider: "codex" });
+      }
+      if (requestedHandoff && !handoff && !result.attachments.length) {
         this.logger.warn("memory.handoff_rejected", { chat_id: chatId, job_id: jobId, provider: "codex" });
       }
+      this.db.recordJobDiagnostic(jobId, "provider.completed", {
+        result_length: result.message.length,
+        output_attachment_count: result.attachments.length,
+        outbox_count: outbound.length,
+      });
       this.db.completeJob(
         jobId,
         result.message,
@@ -454,6 +500,10 @@ export class LiveCodexConversationManager implements LiveCodexConversations {
       true,
     );
     if (!changed) return;
+    this.db.recordJobDiagnostic(jobId, "job.failed", {
+      provider: "codex",
+      failure_kind: "live_codex",
+    });
     this.clearChat(chatId);
     if (conversation?.thread_id && conversation.active_turn_id) {
       void this.server()
